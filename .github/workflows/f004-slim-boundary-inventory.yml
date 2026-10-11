@@ -1,0 +1,260 @@
+name: f004-slim-boundary-inventory
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  passive-boundary-inventory:
+    runs-on: ubuntu-slim
+    timeout-minutes: 10
+    env:
+      F004_CAPTURE_CERT: ${{ secrets.F004_CAPTURE_CERT }}
+    steps:
+      - name: Capture passive container and host-boundary evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          test -n "$F004_CAPTURE_CERT"
+          raw="$RUNNER_TEMP/f004-slim-raw"
+          sealed="$RUNNER_TEMP/f004-slim-sealed"
+          mkdir -p "$raw" "$sealed"
+
+          cp /opt/hca/.settings "$raw/hca.settings"
+          id > "$raw/id.txt"
+          uname -a > "$raw/uname.txt"
+          systemd-detect-virt > "$raw/virtualization.txt" 2>&1 || true
+          ps -eo user,pid,ppid,lstart,args ww > "$raw/processes.txt"
+          cat /proc/self/status > "$raw/self-status.txt"
+          cat /proc/1/status > "$raw/pid1-status.txt"
+          cat /proc/self/cgroup > "$raw/self-cgroup.txt"
+          cat /proc/1/cgroup > "$raw/pid1-cgroup.txt"
+          cat /proc/self/uid_map > "$raw/self-uid-map.txt" 2>&1 || true
+          cat /proc/self/gid_map > "$raw/self-gid-map.txt" 2>&1 || true
+          cat /proc/self/mountinfo > "$raw/self-mountinfo.txt"
+          cat /proc/filesystems > "$raw/filesystems.txt"
+          ls -la / /opt/hca /dev /run /var/run > "$raw/path-listing.txt" 2>&1 || true
+          find /run /var/run -maxdepth 4 -type s -printf '%M %u %g %p\n' \
+            > "$raw/runtime-sockets.txt" 2>&1 || true
+          find /dev -maxdepth 3 -printf '%y %M %u %g %t:%T %p\n' \
+            > "$raw/devices.txt" 2>&1 || true
+          find /sys/fs/cgroup -maxdepth 2 -printf '%y %M %u %g %p\n' \
+            > "$raw/cgroup-tree.txt" 2>&1 || true
+          findmnt --json > "$raw/findmnt.json" 2>&1 || true
+          lsns --json > "$raw/lsns.json" 2>&1 || true
+          ss -lxpna > "$raw/unix-sockets.txt" 2>&1 || true
+          ip -details link > "$raw/network-links.txt" 2>&1 || true
+          ip route show table all > "$raw/network-routes.txt" 2>&1 || true
+          capsh --print > "$raw/capabilities.txt" 2>&1 || true
+          stat / /proc/1/root /opt/hca /opt/hca/.settings /sys/fs/cgroup \
+            > "$raw/path-stat.txt" 2>&1 || true
+          readlink /proc/1/root > "$raw/pid1-root-link.txt" 2>&1 || true
+          for namespace in cgroup ipc mnt net pid pid_for_children time time_for_children user uts; do
+            printf '%s self=%s pid1=%s\n' "$namespace" \
+              "$(readlink "/proc/self/ns/$namespace" 2>/dev/null || true)" \
+              "$(readlink "/proc/1/ns/$namespace" 2>/dev/null || true)"
+          done > "$raw/namespaces.txt"
+
+          hca_pid=$(pgrep -o -f '/opt/hca/hosted-compute-agent' || true)
+          if [[ -n "$hca_pid" ]]; then
+            printf '%s\n' "$hca_pid" > "$raw/hca-pid.txt"
+            cat "/proc/$hca_pid/status" > "$raw/hca-status.txt" 2>&1 || true
+            cat "/proc/$hca_pid/cgroup" > "$raw/hca-cgroup.txt" 2>&1 || true
+            for namespace in cgroup ipc mnt net pid pid_for_children time time_for_children user uts; do
+              printf '%s %s\n' "$namespace" \
+                "$(readlink "/proc/$hca_pid/ns/$namespace" 2>/dev/null || true)"
+            done > "$raw/hca-namespaces.txt"
+          fi
+
+          python3 - "$raw" "$sealed/metadata.json" <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import stat
+
+          raw = pathlib.Path(os.sys.argv[1])
+          output = pathlib.Path(os.sys.argv[2])
+
+          def read(path):
+              try:
+                  return pathlib.Path(path).read_text(errors='replace')
+              except OSError:
+                  return ''
+
+          def status_fields(path):
+              fields = {}
+              for line in read(path).splitlines():
+                  if ':' in line:
+                      key, value = line.split(':', 1)
+                      fields[key] = value.strip()
+              return fields
+
+          def namespace_set(pid):
+              values = {}
+              for name in (
+                  'cgroup', 'ipc', 'mnt', 'net', 'pid', 'pid_for_children',
+                  'time', 'time_for_children', 'user', 'uts'
+              ):
+                  try:
+                      values[name] = os.readlink(f'/proc/{pid}/ns/{name}')
+                  except OSError:
+                      values[name] = ''
+              return values
+
+          def same_object(left, right):
+              try:
+                  left_stat = os.stat(left)
+                  right_stat = os.stat(right)
+              except OSError:
+                  return None
+              return (
+                  left_stat.st_dev == right_stat.st_dev
+                  and left_stat.st_ino == right_stat.st_ino
+              )
+
+          def is_socket(path):
+              try:
+                  return stat.S_ISSOCK(os.stat(path).st_mode)
+              except OSError:
+                  return False
+
+          def mount_for(path):
+              target = pathlib.Path(path)
+              best = None
+              for line in read('/proc/self/mountinfo').splitlines():
+                  left, separator, right = line.partition(' - ')
+                  if not separator:
+                      continue
+                  fields = left.split()
+                  right_fields = right.split()
+                  if len(fields) < 6 or len(right_fields) < 2:
+                      continue
+                  mount_point = pathlib.Path(fields[4].replace('\\040', ' '))
+                  try:
+                      target.relative_to(mount_point)
+                  except ValueError:
+                      continue
+                  record = {
+                      'mount_point': str(mount_point),
+                      'mount_options': fields[5].split(','),
+                      'fs_type': right_fields[0],
+                      'source_sha256': hashlib.sha256(
+                          right_fields[1].encode()
+                      ).hexdigest(),
+                  }
+                  if best is None or len(str(mount_point)) > len(best['mount_point']):
+                      best = record
+              return best or {}
+
+          self_status = status_fields('/proc/self/status')
+          pid1_status = status_fields('/proc/1/status')
+          cap_eff = int(self_status.get('CapEff', '0'), 16)
+          dangerous_capabilities = {
+              'CAP_DAC_READ_SEARCH': 2,
+              'CAP_NET_ADMIN': 12,
+              'CAP_SYS_MODULE': 16,
+              'CAP_SYS_RAWIO': 17,
+              'CAP_SYS_PTRACE': 19,
+              'CAP_SYS_ADMIN': 21,
+              'CAP_MKNOD': 27,
+              'CAP_PERFMON': 38,
+              'CAP_BPF': 39,
+              'CAP_CHECKPOINT_RESTORE': 40,
+          }
+          self_namespaces = namespace_set('self')
+          pid1_namespaces = namespace_set('1')
+          hca_pid_text = read(raw / 'hca-pid.txt').strip()
+          hca_namespaces = namespace_set(hca_pid_text) if hca_pid_text else {}
+          known_sockets = [
+              '/var/run/docker.sock',
+              '/run/docker.sock',
+              '/run/containerd/containerd.sock',
+              '/run/crio/crio.sock',
+              '/var/run/crio/crio.sock',
+              '/run/podman/podman.sock',
+          ]
+          known_devices = [
+              '/dev/kvm', '/dev/vhost-net', '/dev/vfio/vfio', '/dev/fuse',
+              '/dev/vmbus/hv_kvp', '/dev/mem', '/dev/kmem',
+          ]
+          report = {
+              'repository': os.environ['GITHUB_REPOSITORY'],
+              'run_id': os.environ['GITHUB_RUN_ID'],
+              'run_attempt': os.environ['GITHUB_RUN_ATTEMPT'],
+              'job': os.environ['GITHUB_JOB'],
+              'runner_name': os.environ['RUNNER_NAME'],
+              'runner_os': os.environ['RUNNER_OS'],
+              'runner_arch': os.environ['RUNNER_ARCH'],
+              'euid': os.geteuid(),
+              'virtualization': read(raw / 'virtualization.txt').strip(),
+              'dockerenv_present': pathlib.Path('/.dockerenv').exists(),
+              'pid1_comm': read('/proc/1/comm').strip(),
+              'visible_pid_count': len([
+                  path for path in pathlib.Path('/proc').iterdir()
+                  if path.name.isdigit()
+              ]),
+              'self_status': {
+                  key: self_status.get(key, '')
+                  for key in ('CapEff', 'NoNewPrivs', 'Seccomp', 'NSpid')
+              },
+              'pid1_status': {
+                  key: pid1_status.get(key, '')
+                  for key in ('CapEff', 'NoNewPrivs', 'Seccomp', 'NSpid')
+              },
+              'dangerous_effective_capabilities': [
+                  name for name, bit in dangerous_capabilities.items()
+                  if cap_eff & (1 << bit)
+              ],
+              'uid_map': read('/proc/self/uid_map').strip(),
+              'gid_map': read('/proc/self/gid_map').strip(),
+              'self_equals_pid1_namespaces': {
+                  name: self_namespaces.get(name) == pid1_namespaces.get(name)
+                  for name in self_namespaces
+              },
+              'hca_process_present': bool(hca_pid_text),
+              'self_equals_hca_namespaces': {
+                  name: self_namespaces.get(name) == hca_namespaces.get(name)
+                  for name in self_namespaces
+              } if hca_namespaces else {},
+              'root_equals_pid1_root': same_object('/', '/proc/1/root'),
+              'settings_mount': mount_for('/opt/hca/.settings'),
+              'root_mount': mount_for('/'),
+              'known_control_sockets': {
+                  path: is_socket(path) for path in known_sockets
+              },
+              'known_host_devices': {
+                  path: pathlib.Path(path).exists() for path in known_devices
+              },
+              'cgroup_root_writable': os.access('/sys/fs/cgroup', os.W_OK),
+              'proc_sysrq_trigger_writable': os.access('/proc/sysrq-trigger', os.W_OK),
+              'apparmor_profile': read('/proc/self/attr/current').strip(),
+              'settings_sha256': hashlib.sha256(
+                  (raw / 'hca.settings').read_bytes()
+              ).hexdigest(),
+          }
+          output.write_text(json.dumps(report, indent=2) + '\n')
+          print(json.dumps(report, indent=2))
+          PY
+
+          printf '%s\n' "$F004_CAPTURE_CERT" > "$RUNNER_TEMP/f004-certificate.pem"
+          tar -C "$raw" -cf "$RUNNER_TEMP/f004-slim-passive.tar" .
+          openssl cms -encrypt -binary -aes-256-cbc \
+            -in "$RUNNER_TEMP/f004-slim-passive.tar" \
+            -outform DER \
+            -out "$sealed/payload.cms" \
+            "$RUNNER_TEMP/f004-certificate.pem"
+          shasum -a 256 "$sealed/payload.cms" | awk '{print $1}' > "$sealed/payload.cms.sha256"
+          shred -u "$RUNNER_TEMP/f004-certificate.pem" "$RUNNER_TEMP/f004-slim-passive.tar"
+          rm -rf "$raw"
+
+      - name: Upload sanitized metadata and encrypted passive evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: f004-slim-boundary-${{ github.run_id }}
+          path: ${{ runner.temp }}/f004-slim-sealed
+          retention-days: 1
+          compression-level: 0
