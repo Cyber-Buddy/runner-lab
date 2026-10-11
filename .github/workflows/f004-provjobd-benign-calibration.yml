@@ -1,0 +1,182 @@
+name: f004-provjobd-benign-calibration
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  calibrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    env:
+      F004_CAPTURE_CERT: ${{ secrets.F004_CAPTURE_CERT }}
+    steps:
+      - name: Capture encrypted pre-trigger authority
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          test -n "$F004_CAPTURE_CERT"
+          raw="$RUNNER_TEMP/f004-provjobd-pre-raw"
+          sealed="$RUNNER_TEMP/f004-provjobd-pre-sealed"
+          mkdir -p "$raw" "$sealed"
+
+          provjobd_pid=$(pgrep -o -f '^/tmp/provjobd[0-9]+$')
+          test -n "$provjobd_pid"
+          sudo cp /opt/hca/.settings "$raw/hca.settings"
+          sudo cp /opt/hca/provjobd_override.json "$raw/provjobd_override.json" 2>/dev/null || true
+          sudo cp "/proc/$provjobd_pid/status" "$raw/provjobd.status"
+          sudo journalctl --no-pager -u hosted-compute-agent.service > "$raw/hca-journal-before.txt" || true
+          ps -eo user,pid,ppid,stat,lstart,args ww > "$raw/processes-before.txt"
+          printf '%s\n' "$GITHUB_RUN_ID:f004-benign-process-name-calibration" > "$raw/owned-canary.txt"
+          sudo chown -R "$USER:$USER" "$raw"
+
+          jq -n \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg runner_name "$RUNNER_NAME" \
+            --arg provjobd_pid "$provjobd_pid" \
+            '{repository:$repository,run_id:$run_id,runner_name:$runner_name,provjobd_pid:$provjobd_pid,canary_kind:"benign process name only"}' \
+            > "$sealed/metadata.json"
+
+          printf '%s\n' "$F004_CAPTURE_CERT" > "$RUNNER_TEMP/f004-certificate.pem"
+          tar -C "$raw" -cf "$RUNNER_TEMP/f004-provjobd-pre.tar" .
+          openssl cms -encrypt -binary -aes-256-cbc \
+            -in "$RUNNER_TEMP/f004-provjobd-pre.tar" \
+            -outform DER \
+            -out "$sealed/payload.cms" \
+            "$RUNNER_TEMP/f004-certificate.pem"
+          shasum -a 256 "$sealed/payload.cms" | awk '{print $1}' > "$sealed/payload.cms.sha256"
+          shred -u "$RUNNER_TEMP/f004-provjobd-pre.tar" "$RUNNER_TEMP/f004-certificate.pem"
+          sudo rm -rf "$raw"
+
+      - name: Upload encrypted pre-trigger authority
+        uses: actions/upload-artifact@v4
+        with:
+          name: f004-provjobd-pre-${{ github.run_id }}
+          path: ${{ runner.temp }}/f004-provjobd-pre-sealed
+          retention-days: 1
+          compression-level: 0
+
+      - name: Exercise harmless process-name canary
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          raw="$RUNNER_TEMP/f004-provjobd-calibration-raw"
+          mkdir -p "$raw"
+          provjobd_pid=$(pgrep -o -f '^/tmp/provjobd[0-9]+$')
+          test -n "$provjobd_pid"
+
+          cat > "$RUNNER_TEMP/f004-benign-canary.c" <<'C'
+          #include <signal.h>
+          #include <stdio.h>
+          #include <unistd.h>
+
+          static volatile sig_atomic_t stopped;
+          static void stop_handler(int signal_number) {
+            stopped = signal_number;
+          }
+
+          int main(void) {
+            signal(SIGTERM, stop_handler);
+            signal(SIGINT, stop_handler);
+            puts("F004_BENIGN_PROCESS_NAME_CANARY_NO_MINING_OR_HASHING");
+            fflush(stdout);
+            for (int index = 0; index < 180 && !stopped; index++) {
+              sleep(1);
+            }
+            return stopped ? 128 + stopped : 0;
+          }
+          C
+          gcc -O0 -s "$RUNNER_TEMP/f004-benign-canary.c" -o "$RUNNER_TEMP/xmrig"
+          shasum -a 256 "$RUNNER_TEMP/xmrig" > "$raw/canary.sha256"
+          strings "$RUNNER_TEMP/xmrig" | rg 'F004_BENIGN_PROCESS_NAME_CANARY_NO_MINING_OR_HASHING' > "$raw/canary-marker.txt"
+
+          if command -v strace >/dev/null 2>&1; then
+            sudo strace -ff -s 16384 -e trace=write -e write=2 \
+              -p "$provjobd_pid" -o "$raw/provjobd-write" &
+            tracer_pid=$!
+          else
+            tracer_pid=''
+          fi
+
+          printf 'timestamp\tcanary_pid\tcanary_alive\tcanary_comm\trunner_worker_alive\tprovjobd_alive\thca_alive\n' > "$raw/timeline.tsv"
+          "$RUNNER_TEMP/xmrig" 1> "$raw/canary.stdout" 2> "$raw/canary.stderr" &
+          canary_pid=$!
+          sleep 1
+
+          for index in $(seq 0 120); do
+            timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+            canary_alive=no
+            canary_comm=''
+            runner_worker_alive=no
+            provjobd_alive=no
+            hca_alive=no
+            if kill -0 "$canary_pid" 2>/dev/null; then
+              canary_alive=yes
+              canary_comm=$(cat "/proc/$canary_pid/comm" 2>/dev/null || true)
+            fi
+            pgrep -f 'Runner.Worker' >/dev/null && runner_worker_alive=yes || true
+            kill -0 "$provjobd_pid" 2>/dev/null && provjobd_alive=yes || true
+            systemctl is-active --quiet hosted-compute-agent.service && hca_alive=yes || true
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+              "$timestamp" "$canary_pid" "$canary_alive" "$canary_comm" \
+              "$runner_worker_alive" "$provjobd_alive" "$hca_alive" \
+              | tee -a "$raw/timeline.tsv"
+            if [[ "$canary_alive" == no ]]; then
+              break
+            fi
+            sleep 1
+          done
+
+          set +e
+          wait "$canary_pid"
+          canary_status=$?
+          set -e
+          printf '%s\n' "$canary_status" > "$raw/canary-exit-status.txt"
+          if [[ -n "$tracer_pid" ]]; then
+            sudo kill -INT "$tracer_pid" 2>/dev/null || true
+            wait "$tracer_pid" 2>/dev/null || true
+          fi
+          sudo journalctl --no-pager -u hosted-compute-agent.service > "$raw/hca-journal-after.txt" || true
+          ps -eo user,pid,ppid,stat,lstart,args ww > "$raw/processes-after.txt"
+
+      - name: Seal calibration evidence
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          test -n "$F004_CAPTURE_CERT"
+          raw="$RUNNER_TEMP/f004-provjobd-calibration-raw"
+          sealed="$RUNNER_TEMP/f004-provjobd-calibration-sealed"
+          mkdir -p "$raw" "$sealed"
+          sudo chown -R "$USER:$USER" "$raw" 2>/dev/null || true
+          printf '%s\n' "$F004_CAPTURE_CERT" > "$RUNNER_TEMP/f004-certificate.pem"
+          tar -C "$raw" -cf "$RUNNER_TEMP/f004-provjobd-calibration.tar" .
+          openssl cms -encrypt -binary -aes-256-cbc \
+            -in "$RUNNER_TEMP/f004-provjobd-calibration.tar" \
+            -outform DER \
+            -out "$sealed/payload.cms" \
+            "$RUNNER_TEMP/f004-certificate.pem"
+          shasum -a 256 "$sealed/payload.cms" | awk '{print $1}' > "$sealed/payload.cms.sha256"
+          jq -n \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg runner_name "$RUNNER_NAME" \
+            '{repository:$repository,run_id:$run_id,runner_name:$runner_name,canary_kind:"benign process name only"}' \
+            > "$sealed/metadata.json"
+          shred -u "$RUNNER_TEMP/f004-provjobd-calibration.tar" "$RUNNER_TEMP/f004-certificate.pem"
+          sudo rm -rf "$raw"
+
+      - name: Upload encrypted calibration evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: f004-provjobd-calibration-${{ github.run_id }}
+          path: ${{ runner.temp }}/f004-provjobd-calibration-sealed
+          retention-days: 1
+          compression-level: 0
