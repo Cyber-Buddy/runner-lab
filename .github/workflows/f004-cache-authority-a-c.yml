@@ -1,0 +1,78 @@
+name: F004 cache authority A-C
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  controlled:
+    name: controlled-${{ matrix.side }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        side: [A, C]
+    env:
+      F004_SIDE: ${{ matrix.side }}
+      F004_CAPTURE_CERT: ${{ secrets.F004_CAPTURE_CERT }}
+    steps:
+      - name: Capture encrypted cache authority
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$F004_CAPTURE_CERT"
+          raw="$RUNNER_TEMP/f004-cache-raw"
+          sealed="$RUNNER_TEMP/f004-cache-sealed"
+          mkdir -p "$raw" "$sealed"
+          chmod 700 "$raw" "$sealed"
+          canary="F004-CACHE-${F004_SIDE}-${GITHUB_RUN_ID}-$(openssl rand -hex 24)"
+
+          jq -n \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg ref "$GITHUB_REF" \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg side "$F004_SIDE" \
+            --arg runtime_token "$ACTIONS_RUNTIME_TOKEN" \
+            --arg cache_url "$ACTIONS_CACHE_URL" \
+            --arg results_url "$ACTIONS_RESULTS_URL" \
+            --arg cache_service_v2 "${ACTIONS_CACHE_SERVICE_V2:-}" \
+            --arg canary "$canary" \
+            '{repository:$repository,ref:$ref,run_id:$run_id,side:$side,runtime_token:$runtime_token,cache_url:$cache_url,results_url:$results_url,cache_service_v2:$cache_service_v2,canary:$canary}' \
+            > "$raw/authority.json"
+
+          jq -n \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg ref "$GITHUB_REF" \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg side "$F004_SIDE" \
+            --arg runtime_token_sha256 "$(printf '%s' "$ACTIONS_RUNTIME_TOKEN" | shasum -a 256 | awk '{print $1}')" \
+            --arg cache_url_sha256 "$(printf '%s' "$ACTIONS_CACHE_URL" | shasum -a 256 | awk '{print $1}')" \
+            --arg results_url_sha256 "$(printf '%s' "$ACTIONS_RESULTS_URL" | shasum -a 256 | awk '{print $1}')" \
+            --arg canary_sha256 "$(printf '%s' "$canary" | shasum -a 256 | awk '{print $1}')" \
+            '{repository:$repository,ref:$ref,run_id:$run_id,side:$side,runtime_token_sha256:$runtime_token_sha256,cache_url_sha256:$cache_url_sha256,results_url_sha256:$results_url_sha256,canary_sha256:$canary_sha256}' \
+            > "$sealed/metadata.json"
+
+          printf '%s\n' "$F004_CAPTURE_CERT" > "$RUNNER_TEMP/f004-certificate.pem"
+          tar -C "$raw" -cf "$RUNNER_TEMP/f004-cache-authority.tar" .
+          openssl cms -encrypt -binary -aes-256-cbc \
+            -in "$RUNNER_TEMP/f004-cache-authority.tar" \
+            -outform DER \
+            -out "$sealed/payload.cms" \
+            "$RUNNER_TEMP/f004-certificate.pem"
+          shasum -a 256 "$sealed/payload.cms" | awk '{print $1}' > "$sealed/payload.cms.sha256"
+          shred -u "$RUNNER_TEMP/f004-cache-authority.tar" "$RUNNER_TEMP/f004-certificate.pem"
+          rm -rf "$raw"
+
+      - name: Upload encrypted cache authority
+        uses: actions/upload-artifact@v4
+        with:
+          name: f004-cache-${{ matrix.side }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/f004-cache-sealed
+          retention-days: 1
+          compression-level: 0
+
+      - name: Hold controlled cache job live
+        run: sleep 900
