@@ -11,7 +11,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        side: [A, B, C]
+        side: [A, C]
     name: controlled-${{ matrix.side }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -216,37 +216,12 @@ jobs:
         shell: bash
         run: sleep 600
 
-  queue-gate:
-    runs-on: ubuntu-latest
-    timeout-minutes: 2
-    steps:
-      - name: Delay target admission until blocker is active
-        shell: bash
-        run: sleep 25
-
-  queue-blocker:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    concurrency:
-      group: f004-queuedrequests-controlled
-      cancel-in-progress: false
-    steps:
-      - name: Hold researcher-owned concurrency slot
-        shell: bash
-        run: |
-          printf 'F004_QUEUE_BLOCKER run=%s attempt=%s\n' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
-          sleep 420
-
-  queued-target-b:
-    needs: queue-gate
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    concurrency:
-      group: f004-queuedrequests-controlled
-      cancel-in-progress: false
+  service-queued-b:
+    name: F004-SERVICE-QUEUED-B-${{ github.run_id }}-${{ github.run_attempt }}-91e9a2c7
+    runs-on: [ubuntu-latest, f004-no-runner-91e9a2c7]
     env:
-      F004_QUEUED_CANARY: F004-QUEUED-B-${{ github.run_id }}-${{ github.run_attempt }}-4cb9331a
+      F004_QUEUED_CANARY: F004-SERVICE-QUEUE-B-${{ github.run_id }}-${{ github.run_attempt }}-91e9a2c7
     steps:
-      - name: Emit B canary only after queue release
+      - name: F004-SERVICE-ENVELOPE-B-${{ github.run_id }}-${{ github.run_attempt }}-91e9a2c7
         shell: bash
         run: printf 'F004_QUEUED_CANARY=%s\n' "$F004_QUEUED_CANARY"
