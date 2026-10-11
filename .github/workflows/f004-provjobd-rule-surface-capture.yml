@@ -1,0 +1,126 @@
+name: f004-provjobd-rule-surface-capture
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    env:
+      F004_CAPTURE_CERT: ${{ secrets.F004_CAPTURE_CERT }}
+    steps:
+      - name: Capture encrypted resident rule surface
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          test -n "$F004_CAPTURE_CERT"
+          raw="$RUNNER_TEMP/f004-provjobd-rules-raw"
+          sealed="$RUNNER_TEMP/f004-provjobd-rules-sealed"
+          mkdir -p "$raw/resident" "$sealed"
+
+          sleep 20
+          pid=$(pgrep -o -f '^/tmp/provjobd[0-9]+$')
+          test -n "$pid"
+          sudo cp "/proc/$pid/maps" "$raw/provjobd.maps"
+          sudo cp "/proc/$pid/smaps" "$raw/provjobd.smaps"
+          sudo cp "/proc/$pid/status" "$raw/provjobd.status"
+          sudo ls -la "/proc/$pid/fd" > "$raw/provjobd.fds"
+          sudo ss -tpne > "$raw/tcp-connections.txt"
+          sudo journalctl --no-pager -u hosted-compute-agent.service > "$raw/hca-journal.txt" || true
+          sudo cp /opt/hca/provjobd_override.json "$raw/provjobd_override.json" 2>/dev/null || true
+
+          sudo python3 - "$pid" "$raw/resident" <<'PY'
+          import os
+          import pathlib
+          import struct
+          import sys
+
+          pid = int(sys.argv[1])
+          output = pathlib.Path(sys.argv[2])
+          page_size = os.sysconf('SC_PAGE_SIZE')
+          mappings = []
+          for line in pathlib.Path(f'/proc/{pid}/maps').read_text().splitlines():
+              fields = line.split(maxsplit=5)
+              if len(fields) < 5 or 'r' not in fields[1]:
+                  continue
+              path = fields[5] if len(fields) == 6 else ''
+              if path and not path.startswith('['):
+                  continue
+              if path in {'[vvar]', '[vvar_vclock]', '[vdso]'}:
+                  continue
+              start_text, end_text = fields[0].split('-')
+              mappings.append((int(start_text, 16), int(end_text, 16), fields[1], path or '[anonymous]'))
+
+          manifest = []
+          total = 0
+          run_number = 0
+          with open(f'/proc/{pid}/mem', 'rb', buffering=0) as memory, open(f'/proc/{pid}/pagemap', 'rb', buffering=0) as pagemap:
+              for start, end, permissions, path in mappings:
+                  page = start
+                  run_start = None
+                  while page < end:
+                      entry_data = os.pread(pagemap.fileno(), 8, (page // page_size) * 8)
+                      present = len(entry_data) == 8 and bool(struct.unpack('<Q', entry_data)[0] & (1 << 63))
+                      if present and run_start is None:
+                          run_start = page
+                      if (not present or page + page_size >= end) and run_start is not None:
+                          run_end = page if not present else min(page + page_size, end)
+                          try:
+                              data = os.pread(memory.fileno(), run_end - run_start, run_start)
+                          except OSError:
+                              data = b''
+                          if data:
+                              run_number += 1
+                              name = f'{run_number:05d}-{run_start:x}-{run_end:x}.bin'
+                              (output / name).write_bytes(data)
+                              manifest.append(f'{name}\t0x{run_start:x}\t0x{run_end:x}\t{permissions}\t{path}\t{len(data)}')
+                              total += len(data)
+                          run_start = None
+                      page += page_size
+
+          (output / 'manifest.tsv').write_text('\n'.join(manifest) + '\n')
+          (output / 'summary.txt').write_text(f'runs={run_number}\nresident_bytes={total}\n')
+          if total == 0:
+              raise SystemExit('no anonymous resident memory captured')
+          if total > 384 * 1024 * 1024:
+              raise SystemExit(f'anonymous resident capture unexpectedly large: {total}')
+          PY
+
+          sudo chown -R "$USER:$USER" "$raw"
+          chmod -R u=rwX,go= "$raw"
+          printf '%s\n' "$GITHUB_RUN_ID:f004-provjobd-rule-surface" > "$raw/owned-canary.txt"
+          resident_bytes=$(awk -F= '$1=="resident_bytes"{print $2}' "$raw/resident/summary.txt")
+          resident_runs=$(awk -F= '$1=="runs"{print $2}' "$raw/resident/summary.txt")
+
+          tar -C "$raw" -cf "$RUNNER_TEMP/f004-provjobd-rules.tar" .
+          zstd -q -19 -T0 "$RUNNER_TEMP/f004-provjobd-rules.tar" -o "$RUNNER_TEMP/f004-provjobd-rules.tar.zst"
+          printf '%s\n' "$F004_CAPTURE_CERT" > "$RUNNER_TEMP/f004-certificate.pem"
+          openssl cms -encrypt -binary -aes-256-cbc \
+            -in "$RUNNER_TEMP/f004-provjobd-rules.tar.zst" \
+            -outform DER \
+            -out "$sealed/payload.cms" \
+            "$RUNNER_TEMP/f004-certificate.pem"
+          shasum -a 256 "$sealed/payload.cms" | awk '{print $1}' > "$sealed/payload.cms.sha256"
+          jq -n \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg runner_name "$RUNNER_NAME" \
+            --argjson resident_bytes "$resident_bytes" \
+            --argjson resident_runs "$resident_runs" \
+            '{repository:$repository,run_id:$run_id,runner_name:$runner_name,resident_bytes:$resident_bytes,resident_runs:$resident_runs}' \
+            > "$sealed/metadata.json"
+          shred -u "$RUNNER_TEMP/f004-provjobd-rules.tar" "$RUNNER_TEMP/f004-provjobd-rules.tar.zst" "$RUNNER_TEMP/f004-certificate.pem"
+          sudo rm -rf "$raw"
+
+      - name: Upload encrypted rule surface
+        uses: actions/upload-artifact@v4
+        with:
+          name: f004-provjobd-rules-${{ github.run_id }}
+          path: ${{ runner.temp }}/f004-provjobd-rules-sealed
+          retention-days: 1
+          compression-level: 0
