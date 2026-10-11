@@ -1,0 +1,75 @@
+name: F004 cache v1 A-token B-URL restore
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  a-cross:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    env:
+      F004_CAPTURE_CERT: ${{ secrets.F004_CAPTURE_CERT }}
+      EXPECTED_SHA256: 84ebefe2bb65b60cdcc8a21a95b06c172bcacfaa2dd62fffaad0f07ee2a420e8
+      CACHE_KEY: f004-b-v1-own-38155309166
+    steps:
+      - name: Restore with A token and B cache URL
+        id: restore
+        continue-on-error: true
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+        env:
+          ACTIONS_CACHE_SERVICE_V2: ""
+          ACTIONS_CACHE_URL: ${{ secrets.F004_B_CACHE_URL }}
+        with:
+          key: f004-b-v1-own-38155309166
+          path: ${{ runner.temp }}/f004-v1-own/marker.bin
+
+      - name: Seal A-side restore evidence
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$F004_CAPTURE_CERT"
+          file="$RUNNER_TEMP/f004-v1-own/marker.bin"
+          raw="$RUNNER_TEMP/f004-v1-cross-raw"
+          sealed="$RUNNER_TEMP/f004-v1-cross-sealed"
+          mkdir -p "$raw" "$sealed"
+          present=false
+          match=false
+          actual_sha256=""
+          size=0
+          if [[ -f "$file" ]]; then
+            present=true
+            actual_sha256="$(shasum -a 256 "$file" | awk '{print $1}')"
+            size="$(wc -c < "$file" | tr -d ' ')"
+            [[ "$actual_sha256" == "$EXPECTED_SHA256" ]] && match=true
+            cp "$file" "$raw/restored-marker.bin"
+          fi
+          jq -n \
+            --arg run_id "$GITHUB_RUN_ID" --arg repository "$GITHUB_REPOSITORY" \
+            --arg cache_key "$CACHE_KEY" --arg expected_sha256 "$EXPECTED_SHA256" \
+            --arg actual_sha256 "$actual_sha256" --argjson present "$present" \
+            --argjson match "$match" --argjson size "$size" \
+            '{run_id:$run_id,repository:$repository,cache_key:$cache_key,expected_sha256:$expected_sha256,actual_sha256:$actual_sha256,present:$present,match:$match,size:$size}' \
+            > "$raw/result.json"
+          cp "$raw/result.json" "$sealed/result.json"
+          printf 'present=%s match=%s actual_sha256=%s size=%s\n' "$present" "$match" "$actual_sha256" "$size"
+          printf '%s\n' "$F004_CAPTURE_CERT" > "$RUNNER_TEMP/f004-certificate.pem"
+          tar -C "$raw" -cf "$RUNNER_TEMP/f004-v1-cross.tar" .
+          openssl cms -encrypt -binary -aes-256-cbc \
+            -in "$RUNNER_TEMP/f004-v1-cross.tar" -outform DER \
+            -out "$sealed/payload.cms" "$RUNNER_TEMP/f004-certificate.pem"
+          shasum -a 256 "$sealed/payload.cms" | awk '{print $1}' > "$sealed/payload.cms.sha256"
+          shred -u "$RUNNER_TEMP/f004-v1-cross.tar" "$RUNNER_TEMP/f004-certificate.pem"
+          rm -rf "$raw"
+
+      - name: Upload encrypted A-side evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: f004-cache-v1-cross-A-${{ github.run_id }}
+          path: ${{ runner.temp }}/f004-v1-cross-sealed
+          retention-days: 1
+          compression-level: 0
