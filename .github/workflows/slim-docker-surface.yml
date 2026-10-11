@@ -1,0 +1,88 @@
+name: slim-docker-surface
+
+on:
+  push:
+    branches:
+      - probe/slim-docker-surface-20261011
+
+permissions:
+  contents: read
+
+jobs:
+  slim-direct:
+    runs-on: ubuntu-slim
+    timeout-minutes: 5
+    steps:
+      - name: Direct slim baseline
+        run: |
+          set -eu
+          printf 'marker=slim-direct\n'
+          id
+          uname -a
+          command -v docker || true
+          test -S /var/run/docker.sock && printf 'docker_socket=present\n' || printf 'docker_socket=absent\n'
+
+  slim-job-container:
+    runs-on: ubuntu-slim
+    timeout-minutes: 5
+    container:
+      image: alpine:3.20
+    steps:
+      - name: Job-container reachability
+        run: |
+          printf 'marker=slim-job-container-reached\n'
+          id
+          cat /etc/os-release
+
+  slim-service-container:
+    runs-on: ubuntu-slim
+    timeout-minutes: 5
+    services:
+      marker:
+        image: redis:7-alpine
+    steps:
+      - name: Service-container reachability
+        run: |
+          printf 'marker=slim-service-step-reached\n'
+          getent hosts marker || true
+
+  slim-container-action:
+    runs-on: ubuntu-slim
+    timeout-minutes: 5
+    steps:
+      - name: Docker action reachability
+        uses: docker://alpine:3.20
+        with:
+          args: /bin/sh -c "printf 'marker=slim-container-action-reached\\n'; id; cat /etc/os-release"
+
+  vm-job-container-control:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    container:
+      image: alpine:3.20
+    steps:
+      - name: VM job-container control
+        run: |
+          printf 'marker=vm-job-container-control-reached\n'
+          id
+
+  vm-service-container-control:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    services:
+      marker:
+        image: redis:7-alpine
+    steps:
+      - name: VM service-container control
+        run: |
+          printf 'marker=vm-service-control-reached\n'
+          getent hosts marker
+
+  vm-container-action-control:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: VM Docker action control
+        uses: docker://alpine:3.20
+        with:
+          args: /bin/sh -c "printf 'marker=vm-container-action-control-reached\\n'; id"
