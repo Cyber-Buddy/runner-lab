@@ -4,6 +4,7 @@ on:
   workflow_dispatch:
 
 permissions:
+  actions: write
   contents: read
 
 jobs:
@@ -11,12 +12,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        side: [A, B, C]
+        side: [A]
     name: controlled-${{ matrix.side }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
       F004_CAPTURE_CERT: ${{ secrets.F004_CAPTURE_CERT }}
+      F004_GITHUB_JOB_TOKEN: ${{ github.token }}
       F004_SIDE: ${{ matrix.side }}
     steps:
       - name: Emit unique controlled canary
@@ -36,8 +38,33 @@ jobs:
           test -n "$F004_CAPTURE_CERT"
           raw="$RUNNER_TEMP/f004-pipelines-raw"
           sealed="$RUNNER_TEMP/f004-pipelines-sealed"
-          mkdir -p "$raw" "$sealed"
+          mkdir -p "$raw/runner-bootstrap" "$sealed"
           sleep 10
+
+          capture_api_request() {
+            local label=$1
+            local method=$2
+            local url=$3
+            local response_dir="$raw/runner-bootstrap"
+            curl --location --silent --show-error \
+              --request "$method" \
+              --header "Authorization: Bearer $F004_GITHUB_JOB_TOKEN" \
+              --header 'Accept: application/vnd.github+json' \
+              --header 'X-GitHub-Api-Version: 2022-11-28' \
+              --dump-header "$response_dir/$label.headers" \
+              --output "$response_dir/$label.body" \
+              --write-out '%{http_code}\n' \
+              "$url" > "$response_dir/$label.status"
+          }
+
+          capture_api_request \
+            registration-token \
+            POST \
+            'https://api.github.com/repos/chawdamrunal/runner-lab/actions/runners/registration-token'
+          capture_api_request \
+            remove-token \
+            POST \
+            'https://api.github.com/repos/chawdamrunal/runner-lab/actions/runners/remove-token'
 
           listener_pid=$(pgrep -o -f 'Runner.Listener')
           test -n "$listener_pid"
