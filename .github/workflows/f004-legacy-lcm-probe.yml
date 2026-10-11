@@ -1,0 +1,92 @@
+name: f004-legacy-lcm-probe
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Probe current and legacy scheduler routes without exposing credentials
+        shell: bash
+        run: |
+          sudo python3 - <<'PY'
+          import hashlib
+          import json
+          import pathlib
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          settings = json.load(open('/opt/hca/.settings', encoding='utf-8'))
+          base = settings['schedulerApiUrl'].rstrip('/')
+          token = settings['authToken']
+          output = pathlib.Path('/tmp/f004-legacy-lcm-results.json')
+
+          def request(label, url, authenticated):
+              headers = {'User-Agent': 'f004-owned-runner-boundary-probe/1.0'}
+              if authenticated:
+                  headers['Authorization'] = f'Bearer {token}'
+              req = urllib.request.Request(url, headers=headers, method='GET')
+              try:
+                  with urllib.request.urlopen(req, timeout=15) as response:
+                      body = response.read()
+                      status = response.status
+                      response_headers = response.headers
+              except urllib.error.HTTPError as exc:
+                  body = exc.read()
+                  status = exc.code
+                  response_headers = exc.headers
+              except Exception as exc:
+                  return {
+                      'label': label,
+                      'authenticated': authenticated,
+                      'transport_error_type': type(exc).__name__,
+                  }
+              return {
+                  'label': label,
+                  'authenticated': authenticated,
+                  'status': status,
+                  'body_bytes': len(body),
+                  'body_sha256': hashlib.sha256(body).hexdigest(),
+                  'content_type': response_headers.get('Content-Type', ''),
+                  'request_id_present': bool(response_headers.get('X-GitHub-Request-Id')),
+              }
+
+          checks = []
+          checks.append(request('current_request', base + '/request', True))
+          checks.append(request('current_request_no_auth', base + '/request', False))
+          for message_type in ('StartRequest', 'FinishRequest', 'AbortRequest', 'RequestTimedOut'):
+              query = urllib.parse.urlencode({
+                  'api-version': '6.0-preview',
+                  'messageType': message_type,
+              })
+              checks.append(request('legacy_' + message_type, base + '?' + query, True))
+              checks.append(request('legacy_slash_' + message_type, base + '/?' + query, True))
+          query = urllib.parse.urlencode({
+              'api-version': '6.0-preview',
+              'messageType': 'StartRequest',
+          })
+          checks.append(request('legacy_StartRequest_no_auth', base + '?' + query, False))
+
+          result = {
+              'mode': settings.get('mode'),
+              'scheduler_origin': urllib.parse.urlsplit(base).netloc,
+              'scheduler_path': urllib.parse.urlsplit(base).path,
+              'checks': checks,
+          }
+          output.write_text(json.dumps(result, indent=2, sort_keys=True) + '\n')
+          print(output.read_text())
+          PY
+
+      - name: Upload sanitized probe result
+        uses: actions/upload-artifact@v4
+        with:
+          name: f004-legacy-lcm-results
+          path: /tmp/f004-legacy-lcm-results.json
+          if-no-files-found: error
+          retention-days: 1
