@@ -217,11 +217,11 @@ jobs:
         run: sleep 600
 
   service-queued-b:
-    name: F004-SERVICE-QUEUED-B-${{ github.run_id }}-${{ github.run_attempt }}-91e9a2c7
-    runs-on: [ubuntu-latest, f004-no-runner-91e9a2c7]
+    name: F004-DT-QUEUED-B-${{ github.run_id }}-${{ github.run_attempt }}-dd0c6f71
+    runs-on: [self-hosted, macOS, ARM64, f004-dt-queue-dd0c6f71]
     env:
-      F004_QUEUED_CANARY: F004-SERVICE-QUEUE-B-${{ github.run_id }}-${{ github.run_attempt }}-91e9a2c7
+      F004_QUEUED_CANARY: F004-DT-QUEUE-B-${{ github.run_id }}-${{ github.run_attempt }}-dd0c6f71
     steps:
-      - name: F004-SERVICE-ENVELOPE-B-${{ github.run_id }}-${{ github.run_attempt }}-91e9a2c7
+      - name: F004-DT-ENVELOPE-B-${{ github.run_id }}-${{ github.run_attempt }}-dd0c6f71
         shell: bash
         run: printf 'F004_QUEUED_CANARY=%s\n' "$F004_QUEUED_CANARY"
