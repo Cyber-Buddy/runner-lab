@@ -1,0 +1,111 @@
+name: f004-trace-boundary-pair
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  owned-pair:
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        actor:
+          - A
+          - B
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      F004_ACTOR: ${{ matrix.actor }}
+      F004_CAPTURE_CERT: ${{ secrets.F004_CAPTURE_CERT }}
+    steps:
+      - name: Capture encrypted trace authority
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          test -n "$F004_CAPTURE_CERT"
+          raw="$RUNNER_TEMP/f004-trace-raw"
+          sealed="$RUNNER_TEMP/f004-trace-sealed"
+          mkdir -p "$raw" "$sealed"
+          sleep 5
+
+          sudo cp /opt/hca/.settings "$raw/hca.settings"
+          sudo journalctl --no-pager -u hosted-compute-agent > "$raw/hca-journal.txt" 2>&1 || true
+          sudo find /opt/hca/logs -maxdepth 1 -type f -name '*.log' -exec cp {} "$raw/" \; 2>/dev/null || true
+          sudo chown -R "$USER:$USER" "$raw"
+          printf '%s\n' "$GITHUB_RUN_ID:$F004_ACTOR:trace-boundary" > "$raw/actor-canary.txt"
+
+          python3 - "$raw" "$sealed/metadata.json" <<'PY'
+          import base64
+          import hashlib
+          import json
+          import os
+          import pathlib
+
+          raw = pathlib.Path(os.sys.argv[1])
+          output = pathlib.Path(os.sys.argv[2])
+          settings_bytes = (raw / 'hca.settings').read_bytes()
+          settings = json.loads(settings_bytes)
+          token = settings['authToken']
+          payload = token.split('.')[1]
+          payload += '=' * (-len(payload) % 4)
+          claims = json.loads(base64.urlsafe_b64decode(payload))
+          orchestration_id = ''
+          for line in (raw / 'hca-journal.txt').read_text(errors='replace').splitlines():
+              start = line.find('{')
+              if start < 0:
+                  continue
+              try:
+                  record = json.loads(line[start:])
+              except json.JSONDecodeError:
+                  continue
+              if record.get('msg') == 'Processing request':
+                  orchestration_id = str(record.get('orchestration_id', ''))
+                  break
+          report = {
+              'repository': os.environ['GITHUB_REPOSITORY'],
+              'run_id': os.environ['GITHUB_RUN_ID'],
+              'run_attempt': os.environ['GITHUB_RUN_ATTEMPT'],
+              'job': os.environ['GITHUB_JOB'],
+              'actor': os.environ['F004_ACTOR'],
+              'runner_name': os.environ['RUNNER_NAME'],
+              'mode': settings.get('mode'),
+              'token_environment': claims.get('env'),
+              'worker_id_sha256': hashlib.sha256(
+                  str(claims.get('wid', '')).encode()
+              ).hexdigest(),
+              'orchestration_id_present': bool(orchestration_id),
+              'orchestration_id_sha256': hashlib.sha256(
+                  orchestration_id.encode()
+              ).hexdigest(),
+              'settings_sha256': hashlib.sha256(settings_bytes).hexdigest(),
+          }
+          output.write_text(json.dumps(report, indent=2) + '\n')
+          print(json.dumps(report, indent=2))
+          PY
+
+          printf '%s\n' "$F004_CAPTURE_CERT" > "$RUNNER_TEMP/f004-certificate.pem"
+          tar -C "$raw" -cf "$RUNNER_TEMP/f004-trace.tar" .
+          openssl cms -encrypt -binary -aes-256-cbc \
+            -in "$RUNNER_TEMP/f004-trace.tar" \
+            -outform DER \
+            -out "$sealed/payload.cms" \
+            "$RUNNER_TEMP/f004-certificate.pem"
+          shasum -a 256 "$sealed/payload.cms" | awk '{print $1}' > "$sealed/payload.cms.sha256"
+          shred -u "$RUNNER_TEMP/f004-trace.tar" "$RUNNER_TEMP/f004-certificate.pem"
+          sudo rm -rf "$raw"
+
+      - name: Upload encrypted authority
+        uses: actions/upload-artifact@v4
+        with:
+          name: f004-trace-${{ matrix.actor }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/f004-trace-sealed
+          retention-days: 1
+          compression-level: 0
+
+      - name: Hold owned worker live for controlled trace probes
+        shell: bash
+        run: sleep 600
