@@ -19,41 +19,60 @@ jobs:
       F004_SIDE: ${{ matrix.side }}
       F004_CAPTURE_CERT: ${{ secrets.F004_CAPTURE_CERT }}
     steps:
-      - name: Capture encrypted cache authority
+      - name: Capture cache authority inside action runtime
+        uses: actions/github-script@v7
+        env:
+          F004_SIDE: ${{ matrix.side }}
+        with:
+          script: |
+            const crypto = require('crypto');
+            const fs = require('fs');
+            const path = require('path');
+            const env = process.env;
+            const required = ['ACTIONS_RUNTIME_TOKEN', 'ACTIONS_CACHE_URL', 'ACTIONS_RESULTS_URL'];
+            for (const name of required) {
+              if (!env[name]) throw new Error(`${name} is absent inside the action runtime`);
+            }
+            const raw = path.join(env.RUNNER_TEMP, 'f004-cache-raw');
+            const sealed = path.join(env.RUNNER_TEMP, 'f004-cache-sealed');
+            fs.mkdirSync(raw, {recursive: true, mode: 0o700});
+            fs.mkdirSync(sealed, {recursive: true, mode: 0o700});
+            const canary = `F004-CACHE-${env.F004_SIDE}-${env.GITHUB_RUN_ID}-${crypto.randomBytes(24).toString('hex')}`;
+            const authority = {
+              repository: env.GITHUB_REPOSITORY,
+              ref: env.GITHUB_REF,
+              run_id: env.GITHUB_RUN_ID,
+              side: env.F004_SIDE,
+              runtime_token: env.ACTIONS_RUNTIME_TOKEN,
+              cache_url: env.ACTIONS_CACHE_URL,
+              results_url: env.ACTIONS_RESULTS_URL,
+              cache_service_v2: env.ACTIONS_CACHE_SERVICE_V2 || '',
+              canary
+            };
+            const sha256 = value => crypto.createHash('sha256').update(value).digest('hex');
+            const metadata = {
+              repository: authority.repository,
+              ref: authority.ref,
+              run_id: authority.run_id,
+              side: authority.side,
+              runtime_token_sha256: sha256(authority.runtime_token),
+              cache_url_sha256: sha256(authority.cache_url),
+              results_url_sha256: sha256(authority.results_url),
+              canary_sha256: sha256(authority.canary)
+            };
+            fs.writeFileSync(path.join(raw, 'authority.json'), JSON.stringify(authority, null, 2), {mode: 0o600});
+            fs.writeFileSync(path.join(sealed, 'metadata.json'), JSON.stringify(metadata, null, 2), {mode: 0o600});
+            console.log('cache authority captured for encrypted sealing');
+
+      - name: Seal encrypted cache authority
         shell: bash
         run: |
           set -euo pipefail
           test -n "$F004_CAPTURE_CERT"
           raw="$RUNNER_TEMP/f004-cache-raw"
           sealed="$RUNNER_TEMP/f004-cache-sealed"
-          mkdir -p "$raw" "$sealed"
-          chmod 700 "$raw" "$sealed"
-          canary="F004-CACHE-${F004_SIDE}-${GITHUB_RUN_ID}-$(openssl rand -hex 24)"
-
-          jq -n \
-            --arg repository "$GITHUB_REPOSITORY" \
-            --arg ref "$GITHUB_REF" \
-            --arg run_id "$GITHUB_RUN_ID" \
-            --arg side "$F004_SIDE" \
-            --arg runtime_token "$ACTIONS_RUNTIME_TOKEN" \
-            --arg cache_url "$ACTIONS_CACHE_URL" \
-            --arg results_url "$ACTIONS_RESULTS_URL" \
-            --arg cache_service_v2 "${ACTIONS_CACHE_SERVICE_V2:-}" \
-            --arg canary "$canary" \
-            '{repository:$repository,ref:$ref,run_id:$run_id,side:$side,runtime_token:$runtime_token,cache_url:$cache_url,results_url:$results_url,cache_service_v2:$cache_service_v2,canary:$canary}' \
-            > "$raw/authority.json"
-
-          jq -n \
-            --arg repository "$GITHUB_REPOSITORY" \
-            --arg ref "$GITHUB_REF" \
-            --arg run_id "$GITHUB_RUN_ID" \
-            --arg side "$F004_SIDE" \
-            --arg runtime_token_sha256 "$(printf '%s' "$ACTIONS_RUNTIME_TOKEN" | shasum -a 256 | awk '{print $1}')" \
-            --arg cache_url_sha256 "$(printf '%s' "$ACTIONS_CACHE_URL" | shasum -a 256 | awk '{print $1}')" \
-            --arg results_url_sha256 "$(printf '%s' "$ACTIONS_RESULTS_URL" | shasum -a 256 | awk '{print $1}')" \
-            --arg canary_sha256 "$(printf '%s' "$canary" | shasum -a 256 | awk '{print $1}')" \
-            '{repository:$repository,ref:$ref,run_id:$run_id,side:$side,runtime_token_sha256:$runtime_token_sha256,cache_url_sha256:$cache_url_sha256,results_url_sha256:$results_url_sha256,canary_sha256:$canary_sha256}' \
-            > "$sealed/metadata.json"
+          test -s "$raw/authority.json"
+          test -s "$sealed/metadata.json"
 
           printf '%s\n' "$F004_CAPTURE_CERT" > "$RUNNER_TEMP/f004-certificate.pem"
           tar -C "$raw" -cf "$RUNNER_TEMP/f004-cache-authority.tar" .
