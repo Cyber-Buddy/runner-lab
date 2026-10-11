@@ -18,6 +18,7 @@ jobs:
     env:
       F004_CAPTURE_CERT: ${{ secrets.F004_CAPTURE_CERT }}
       F004_SIDE: ${{ matrix.side }}
+      F004_ENVELOPE_CANARY: F004-ENVELOPE-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.side }}-7f94c1b8
     steps:
       - name: Emit unique controlled canary
         shell: bash
@@ -38,6 +39,10 @@ jobs:
           sealed="$RUNNER_TEMP/f004-pipelines-sealed"
           mkdir -p "$raw" "$sealed"
           sleep 10
+
+          sudo cp /opt/hca/.settings "$raw/hca.settings"
+          sudo journalctl --no-pager -u hosted-compute-agent > "$raw/hca-journal.txt"
+          printf '%s\n' "$F004_ENVELOPE_CANARY" > "$raw/envelope-canary.txt"
 
           listener_pid=$(pgrep -o -f 'Runner.Listener')
           test -n "$listener_pid"
@@ -153,6 +158,7 @@ jobs:
 
           sudo chown -R "$USER:$USER" "$raw"
           python3 - "$raw" "$sealed/metadata.json" <<'PY'
+          import base64
           import hashlib
           import json
           import os
@@ -161,7 +167,13 @@ jobs:
 
           raw = pathlib.Path(sys.argv[1])
           canary = (raw / 'runtime-canary.txt').read_bytes().rstrip(b'\n')
+          envelope_canary = (raw / 'envelope-canary.txt').read_bytes().rstrip(b'\n')
           authority = json.loads((raw / 'authority.json').read_text())
+          hca_settings = json.loads((raw / 'hca.settings').read_text())
+          hca_token = hca_settings['authToken'].encode()
+          hca_payload = hca_token.split(b'.')[1]
+          hca_payload += b'=' * (-len(hca_payload) % 4)
+          hca_claims = json.loads(base64.urlsafe_b64decode(hca_payload))
           pathlib.Path(sys.argv[2]).write_text(json.dumps({
               'repository': os.environ['GITHUB_REPOSITORY'],
               'run_id': os.environ['GITHUB_RUN_ID'],
@@ -173,6 +185,10 @@ jobs:
               'token_sha256': authority['token_sha256'],
               'canary_sha256': hashlib.sha256(canary).hexdigest(),
               'canary_length': len(canary),
+              'envelope_canary_sha256': hashlib.sha256(envelope_canary).hexdigest(),
+              'hca_worker_id': hca_claims.get('wid'),
+              'hca_token_sha256': hashlib.sha256(hca_token).hexdigest(),
+              'hca_settings_sha256': hashlib.sha256((raw / 'hca.settings').read_bytes()).hexdigest(),
           }, indent=2) + '\n')
           PY
 
