@@ -69,6 +69,121 @@ jobs:
             done > "$raw/hca-namespaces.txt"
           fi
 
+          if command -v sudo >/dev/null 2>&1 && sudo -n true; then
+            sudo -n python3 - "$hca_pid" <<'PYROOT' > "$sealed/root-metadata.json"
+          import hashlib
+          import json
+          import os
+          import pathlib
+
+          hca_pid = os.sys.argv[1]
+
+          def read(path):
+              try:
+                  return pathlib.Path(path).read_text(errors='replace')
+              except OSError:
+                  return ''
+
+          def status_fields(path):
+              fields = {}
+              for line in read(path).splitlines():
+                  if ':' in line:
+                      key, value = line.split(':', 1)
+                      fields[key] = value.strip()
+              return fields
+
+          def namespace_set(pid):
+              values = {}
+              for name in (
+                  'cgroup', 'ipc', 'mnt', 'net', 'pid', 'pid_for_children',
+                  'time', 'time_for_children', 'user', 'uts'
+              ):
+                  try:
+                      values[name] = {
+                          'value': os.readlink(f'/proc/{pid}/ns/{name}'),
+                          'error': '',
+                      }
+                  except OSError as error:
+                      values[name] = {
+                          'value': '',
+                          'error': f'{error.errno}:{error.strerror}',
+                      }
+              return values
+
+          def object_relation(left, right):
+              try:
+                  left_stat = os.stat(left)
+                  right_stat = os.stat(right)
+              except OSError as error:
+                  return {
+                      'same': None,
+                      'error': f'{error.errno}:{error.strerror}',
+                  }
+              return {
+                  'same': (
+                      left_stat.st_dev == right_stat.st_dev
+                      and left_stat.st_ino == right_stat.st_ino
+                  ),
+                  'error': '',
+              }
+
+          def path_probe(path):
+              try:
+                  path_stat = os.stat(path)
+              except OSError as error:
+                  return {
+                      'exists': False,
+                      'error': f'{error.errno}:{error.strerror}',
+                  }
+              return {
+                  'exists': True,
+                  'mode_type': path_stat.st_mode >> 12,
+                  'device_major': os.major(path_stat.st_dev),
+                  'device_minor': os.minor(path_stat.st_dev),
+                  'inode_sha256': hashlib.sha256(
+                      f'{path_stat.st_dev}:{path_stat.st_ino}'.encode()
+                  ).hexdigest(),
+                  'error': '',
+              }
+
+          root_status = status_fields('/proc/self/status')
+          self_namespaces = namespace_set('self')
+          pid1_namespaces = namespace_set('1')
+          hca_namespaces = namespace_set(hca_pid) if hca_pid else {}
+          paths = (
+              '/proc/1/root',
+              '/proc/1/root/run/gcs',
+              '/proc/1/root/run/containerd/containerd.sock',
+              '/proc/1/root/var/run/docker.sock',
+              '/proc/1/root/var/lib/containerd',
+              '/proc/1/root/dev/kvm',
+              '/proc/1/root/dev/vhost-net',
+              '/proc/1/root/dev/vfio/vfio',
+          )
+          report = {
+              'euid': os.geteuid(),
+              'status': {
+                  key: root_status.get(key, '')
+                  for key in (
+                      'CapInh', 'CapPrm', 'CapEff', 'CapBnd', 'CapAmb',
+                      'NoNewPrivs', 'Seccomp', 'NSpid'
+                  )
+              },
+              'self_namespaces': self_namespaces,
+              'pid1_namespaces': pid1_namespaces,
+              'hca_namespaces': hca_namespaces,
+              'root_vs_pid1_root': object_relation('/', '/proc/1/root'),
+              'root_vs_hca_root': object_relation(
+                  '/', f'/proc/{hca_pid}/root'
+              ) if hca_pid else {'same': None, 'error': 'hca absent'},
+              'path_probes': {path: path_probe(path) for path in paths},
+              'active_namespace_entry_attempted': False,
+              'filesystem_write_probe_attempted': False,
+          }
+          print(json.dumps(report, indent=2))
+          PYROOT
+          fi
+
           python3 - "$raw" "$sealed/metadata.json" <<'PY'
           import hashlib
           import json
@@ -232,6 +347,13 @@ jobs:
               'cgroup_root_writable': os.access('/sys/fs/cgroup', os.W_OK),
               'proc_sysrq_trigger_writable': os.access('/proc/sysrq-trigger', os.W_OK),
               'apparmor_profile': read('/proc/self/attr/current').strip(),
+              'sudo_path_present': any(
+                  pathlib.Path(path, 'sudo').exists()
+                  for path in ('/usr/bin', '/bin', '/usr/local/bin')
+              ),
+              'root_metadata_present': (
+                  output.parent / 'root-metadata.json'
+              ).exists(),
               'settings_sha256': hashlib.sha256(
                   (raw / 'hca.settings').read_bytes()
               ).hexdigest(),
