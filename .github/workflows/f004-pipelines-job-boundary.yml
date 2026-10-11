@@ -47,8 +47,12 @@ jobs:
           sudo cp -a "$runner_root/_diag" "$raw/runner-diag"
           cp "$RUNNER_TEMP/f004-runtime-canary.txt" "$raw/runtime-canary.txt"
           ps -eo user,pid,ppid,stat,lstart,args ww > "$raw/processes.txt"
+          pipelines_url=$(sudo grep -hEo \
+            'https://pipelines[A-Za-z0-9.-]+\.actions\.githubusercontent\.com/[A-Za-z0-9_-]+/' \
+            "$runner_root"/_diag/Worker_*.log | sort -u)
+          test "$(printf '%s\n' "$pipelines_url" | sed '/^$/d' | wc -l)" -eq 1
 
-          sudo python3 - "$raw/authority.json" "$GITHUB_RUN_ID" <<'PY'
+          sudo python3 - "$raw/authority.json" "$GITHUB_RUN_ID" "$pipelines_url" <<'PY'
           import base64
           import hashlib
           import json
@@ -61,10 +65,6 @@ jobs:
           jwt_re = re.compile(
               rb'eyJ[A-Za-z0-9_-]{8,4096}\.[A-Za-z0-9_-]{8,8192}\.'
               rb'[A-Za-z0-9_-]{8,4096}'
-          )
-          pipelines_re = re.compile(
-              rb'https://pipelines[A-Za-z0-9.-]+\.actions\.githubusercontent\.com/'
-              rb'[A-Za-z0-9_-]+/'
           )
           session_re = re.compile(
               rb'GET /message\?sessionId=([0-9a-fA-F-]{36})'
@@ -79,7 +79,6 @@ jobs:
                   return None
 
           tokens = {}
-          pipelines = set()
           sessions = set()
           pids = subprocess.run(
               ['pgrep', '-f', 'Runner.Listener|Runner.Worker'],
@@ -123,9 +122,6 @@ jobs:
                                   and 'Actions.Runner:' in str(parsed.get('scp', ''))
                               ):
                                   tokens[token] = parsed
-                          pipelines.update(
-                              item.decode() for item in pipelines_re.findall(data)
-                          )
                           if comm == 'Runner.Listener':
                               sessions.update(
                                   item.decode().lower()
@@ -136,8 +132,6 @@ jobs:
 
           if len(tokens) != 1:
               raise SystemExit(f'expected one job token, found {len(tokens)}')
-          if len(pipelines) != 1:
-              raise SystemExit(f'expected one Pipelines URL, found {len(pipelines)}')
           if len(sessions) != 1:
               raise SystemExit(f'expected one Broker session, found {len(sessions)}')
           token, parsed = next(iter(tokens.items()))
@@ -151,7 +145,7 @@ jobs:
               'job_id': parsed.get('job_id'),
               'orchestration_id': parsed.get('orch_id'),
               'runner_id': parsed.get('runner_id'),
-              'pipelines_service_url': next(iter(pipelines)),
+              'pipelines_service_url': sys.argv[3],
               'broker_session': next(iter(sessions)),
           }
           pathlib.Path(sys.argv[1]).write_text(json.dumps(result, indent=2) + '\n')
