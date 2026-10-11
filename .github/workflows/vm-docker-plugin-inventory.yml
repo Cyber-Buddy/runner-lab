@@ -1,0 +1,91 @@
+name: vm-docker-plugin-inventory
+
+on:
+  push:
+    branches:
+      - probe/slim-docker-surface-20261011
+
+permissions:
+  contents: read
+
+jobs:
+  daemon-and-plugins:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Docker authority and plugin inventory
+        run: |
+          set -eu
+          printf 'marker=vm-docker-inventory\n'
+          id
+          stat -c 'docker_socket=%a:%U:%G:%t:%T' /var/run/docker.sock
+          docker version
+          docker info --format 'plugins={{json .Plugins}}'
+          docker info --format 'security_options={{json .SecurityOptions}}'
+          docker info --format 'docker_root={{json .DockerRootDir}} driver={{json .Driver}} cgroup={{json .CgroupDriver}}'
+          docker plugin ls || true
+          docker context ls
+          daemon_pid="$(pgrep -xo dockerd)"
+          printf 'dockerd_pid=%s\n' "$daemon_pid"
+          tr '\0' ' ' < "/proc/$daemon_pid/cmdline"
+          printf '\n'
+          systemctl show docker --property=User,Group,ExecStart,FragmentPath,SubState,ActiveState
+          if [ -f /etc/docker/daemon.json ]; then
+            printf 'daemon_json_sha256='
+            sha256sum /etc/docker/daemon.json | cut -d' ' -f1
+            sudo jq 'del(."registry-mirrors")' /etc/docker/daemon.json || true
+          else
+            printf 'daemon_json=absent\n'
+          fi
+
+  service-container-metadata:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    services:
+      marker:
+        image: redis:7-alpine
+    steps:
+      - name: Runner-created service metadata
+        run: |
+          set -eu
+          printf 'marker=vm-service-metadata\n'
+          docker ps --no-trunc
+          container_id="$(docker ps --filter ancestor=redis:7-alpine --format '{{.ID}}' | head -n1)"
+          test -n "$container_id"
+          docker inspect "$container_id" | jq '.[0] | {
+            Id,
+            Name,
+            Image,
+            Config: {Image: .Config.Image, Labels: .Config.Labels},
+            HostConfig: {
+              Binds: .HostConfig.Binds,
+              CapAdd: .HostConfig.CapAdd,
+              CapDrop: .HostConfig.CapDrop,
+              CgroupnsMode: .HostConfig.CgroupnsMode,
+              NetworkMode: .HostConfig.NetworkMode,
+              PidMode: .HostConfig.PidMode,
+              Privileged: .HostConfig.Privileged,
+              SecurityOpt: .HostConfig.SecurityOpt,
+              UsernsMode: .HostConfig.UsernsMode
+            },
+            Mounts,
+            NetworkSettings: {Networks: .NetworkSettings.Networks}
+          }'
+          docker image inspect redis:7-alpine | jq '.[0] | {Id, RepoDigests, Config: {User: .Config.User, Labels: .Config.Labels, Volumes: .Config.Volumes}}'
+
+  job-container-boundary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    container:
+      image: alpine:3.20
+    steps:
+      - name: Job-container boundary inventory
+        run: |
+          set -eu
+          printf 'marker=vm-job-container-boundary\n'
+          id
+          cat /proc/self/status
+          cat /proc/1/status
+          cat /proc/self/cgroup
+          cat /proc/mounts
+          test -S /var/run/docker.sock && printf 'docker_socket=present\n' || printf 'docker_socket=absent\n'

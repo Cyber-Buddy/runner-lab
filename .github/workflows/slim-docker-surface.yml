@@ -1,9 +1,7 @@
 name: slim-docker-surface
 
 on:
-  push:
-    branches:
-      - probe/slim-docker-surface-20261011
+  workflow_dispatch:
 
 permissions:
   contents: read
