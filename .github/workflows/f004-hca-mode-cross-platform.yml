@@ -1,0 +1,395 @@
+name: f004-hca-mode-cross-platform
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unix-fleets:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner_label:
+          - ubuntu-24.04-arm
+          - ubuntu-26.04-arm
+          - macos-15
+          - macos-15-intel
+    runs-on: ${{ matrix.runner_label }}
+    timeout-minutes: 12
+    env:
+      F004_CAPTURE_CERT: ${{ secrets.F004_CAPTURE_CERT }}
+      F004_MATRIX_LABEL: ${{ matrix.runner_label }}
+    steps:
+      - name: Capture sanitized HCA mode inventory
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          test -n "$F004_CAPTURE_CERT"
+          sealed="$RUNNER_TEMP/f004-mode-sealed"
+          raw="$RUNNER_TEMP/f004-mode-raw"
+          mkdir -p "$sealed" "$raw"
+
+          ps -axo pid=,ppid=,user=,comm=,args= | \
+            grep -Ei 'hosted-compute-agent|hosted.compute|/opt/hca' | \
+            grep -Ev 'grep -Ei' > "$raw/hca-processes.txt" || true
+
+          settings_path=''
+          for candidate in \
+            /opt/hca/.settings \
+            /usr/local/opt/hca/.settings \
+            /Users/runner/hca/.settings \
+            /Users/runneradmin/hca/.settings; do
+            if [[ -r "$candidate" ]]; then
+              settings_path="$candidate"
+              break
+            fi
+          done
+          if [[ -z "$settings_path" ]]; then
+            while IFS= read -r candidate; do
+              if python3 - "$candidate" <<'PYCHECK'
+          import json
+          import pathlib
+          import sys
+          try:
+              value = json.loads(pathlib.Path(sys.argv[1]).read_text())
+          except Exception:
+              raise SystemExit(1)
+          keys = {str(key).lower() for key in value}
+          raise SystemExit(0 if {'authtoken', 'mode'} <= keys else 1)
+          PYCHECK
+              then
+                settings_path="$candidate"
+                break
+              fi
+            done < <(
+              find /opt /Users/runner /Users/runneradmin /home/runner \
+                -maxdepth 7 -type f -name .settings 2>/dev/null || true
+            )
+          fi
+
+          hca_present=false
+          if [[ -n "$settings_path" ]]; then
+            cp "$settings_path" "$raw/settings.json"
+            hca_present=true
+          fi
+          export F004_HCA_PRESENT="$hca_present"
+          export F004_KERNEL="$(uname -srm)"
+
+          python3 - "$raw/settings.json" "$sealed/metadata.json" <<'PY'
+          import base64
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import urllib.parse
+
+          settings_path = pathlib.Path(os.sys.argv[1])
+          output_path = pathlib.Path(os.sys.argv[2])
+
+          def get_ci(mapping, name, default=None):
+              for key, value in mapping.items():
+                  if str(key).lower() == name.lower():
+                      return value
+              return default
+
+          report = {
+              'repository': os.environ['GITHUB_REPOSITORY'],
+              'run_id': os.environ['GITHUB_RUN_ID'],
+              'run_attempt': os.environ['GITHUB_RUN_ATTEMPT'],
+              'job': os.environ['GITHUB_JOB'],
+              'matrix_label': os.environ['F004_MATRIX_LABEL'],
+              'runner_name': os.environ['RUNNER_NAME'],
+              'runner_os': os.environ['RUNNER_OS'],
+              'runner_arch': os.environ['RUNNER_ARCH'],
+              'kernel': os.environ['F004_KERNEL'],
+              'hca_present': os.environ['F004_HCA_PRESENT'] == 'true',
+          }
+          if report['hca_present']:
+              settings_bytes = settings_path.read_bytes()
+              settings = json.loads(settings_bytes)
+              token = str(get_ci(settings, 'authToken', '') or '')
+              header = {}
+              claims = {}
+              if token.count('.') == 2:
+                  header_part, payload_part, _ = token.split('.')
+                  for part, destination in (
+                      (header_part, header),
+                      (payload_part, claims),
+                  ):
+                      try:
+                          padded = part + '=' * (-len(part) % 4)
+                          destination.update(json.loads(base64.urlsafe_b64decode(padded)))
+                      except Exception as error:
+                          destination['decode_error_type'] = type(error).__name__
+              endpoints = []
+              for key, value in settings.items():
+                  if not isinstance(value, str):
+                      continue
+                  if not str(key).lower().endswith(('url', 'uri')):
+                      continue
+                  parsed = urllib.parse.urlsplit(value)
+                  endpoints.append({
+                      'key': key,
+                      'scheme': parsed.scheme,
+                      'hostname': parsed.hostname or '',
+                      'port': parsed.port,
+                      'path_sha256': hashlib.sha256(parsed.path.encode()).hexdigest(),
+                      'has_query': bool(parsed.query),
+                  })
+              wid = str(claims.get('wid', ''))
+              report.update({
+                  'settings_keys': sorted(settings),
+                  'mode': get_ci(settings, 'mode'),
+                  'endpoints': endpoints,
+                  'token_alg': header.get('alg'),
+                  'token_kid': header.get('kid'),
+                  'token_issuer': claims.get('iss'),
+                  'token_environment': claims.get('env'),
+                  'token_has_exp': 'exp' in claims,
+                  'worker_id_sha256': hashlib.sha256(wid.encode()).hexdigest(),
+                  'settings_sha256': hashlib.sha256(settings_bytes).hexdigest(),
+              })
+          output_path.write_text(json.dumps(report, indent=2) + '\n')
+          print(json.dumps(report, indent=2))
+          PY
+
+          printf '%s\n' "$F004_CAPTURE_CERT" > "$RUNNER_TEMP/f004-certificate.pem"
+          tar -C "$raw" -cf "$RUNNER_TEMP/f004-mode.tar" .
+          openssl cms -encrypt -binary -aes-256-cbc \
+            -in "$RUNNER_TEMP/f004-mode.tar" \
+            -outform DER \
+            -out "$sealed/payload.cms" \
+            "$RUNNER_TEMP/f004-certificate.pem"
+          shasum -a 256 "$sealed/payload.cms" | awk '{print $1}' > "$sealed/payload.cms.sha256"
+          python3 - "$raw" "$RUNNER_TEMP/f004-mode.tar" "$RUNNER_TEMP/f004-certificate.pem" <<'PYCLEAN'
+          import pathlib
+          import shutil
+          import sys
+
+          raw = pathlib.Path(sys.argv[1])
+          for path_value in sys.argv[2:]:
+              path = pathlib.Path(path_value)
+              if path.is_file():
+                  with path.open('r+b') as stream:
+                      stream.write(b'\0' * path.stat().st_size)
+                  path.unlink()
+          if raw.is_dir():
+              for path in raw.rglob('*'):
+                  if path.is_file():
+                      with path.open('r+b') as stream:
+                          stream.write(b'\0' * path.stat().st_size)
+              shutil.rmtree(raw)
+          PYCLEAN
+
+      - name: Upload sanitized inventory and encrypted source
+        uses: actions/upload-artifact@v4
+        with:
+          name: f004-hca-cross-${{ matrix.runner_label }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/f004-mode-sealed
+          retention-days: 1
+          compression-level: 0
+
+  windows-fleets:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner_label:
+          - windows-2022
+          - windows-2025
+          - windows-11-arm
+    runs-on: ${{ matrix.runner_label }}
+    timeout-minutes: 12
+    env:
+      F004_CAPTURE_CERT: ${{ secrets.F004_CAPTURE_CERT }}
+      F004_MATRIX_LABEL: ${{ matrix.runner_label }}
+    steps:
+      - name: Capture sanitized Windows HCA mode inventory
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:F004_CAPTURE_CERT)) {
+            throw 'F004_CAPTURE_CERT is absent'
+          }
+          $sealed = Join-Path $env:RUNNER_TEMP 'f004-mode-sealed'
+          $raw = Join-Path $env:RUNNER_TEMP 'f004-mode-raw'
+          New-Item -ItemType Directory -Force -Path $sealed, $raw | Out-Null
+
+          $hcaProcesses = @(
+            Get-CimInstance Win32_Process | Where-Object {
+              $_.Name -match '(?i)hosted.*compute|compute.*agent|hosted-compute-agent'
+            }
+          )
+          $hcaProcesses |
+            Select-Object ProcessId, ParentProcessId, Name, ExecutablePath |
+            ConvertTo-Json -Depth 4 |
+            Set-Content -LiteralPath (Join-Path $raw 'hca-processes.json') -Encoding utf8
+
+          $hcaServices = @(
+            Get-CimInstance Win32_Service | Where-Object {
+              $_.Name -match '(?i)hosted.*compute|compute.*agent' -or
+              $_.DisplayName -match '(?i)hosted.*compute|compute.*agent'
+            }
+          )
+          $hcaServices |
+            Select-Object Name, DisplayName, State, StartMode, PathName |
+            ConvertTo-Json -Depth 4 |
+            Set-Content -LiteralPath (Join-Path $raw 'hca-services.json') -Encoding utf8
+
+          $candidates = [System.Collections.Generic.List[string]]::new()
+          foreach ($process in $hcaProcesses) {
+            if (-not [string]::IsNullOrWhiteSpace($process.ExecutablePath)) {
+              $directory = Split-Path -Parent $process.ExecutablePath
+              $candidates.Add((Join-Path $directory '.settings'))
+            }
+          }
+          foreach ($candidate in @(
+            'C:\opt\hca\.settings',
+            'C:\hca\.settings',
+            'C:\ProgramData\GitHub\HostedComputeAgent\.settings',
+            'D:\hca\.settings'
+          )) {
+            $candidates.Add($candidate)
+          }
+
+          $settingsPath = $null
+          foreach ($candidate in ($candidates | Select-Object -Unique)) {
+            if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+              continue
+            }
+            try {
+              $candidateSettings = Get-Content -LiteralPath $candidate -Raw | ConvertFrom-Json
+              $candidateKeys = @($candidateSettings.PSObject.Properties.Name)
+              if ($candidateKeys -icontains 'authToken' -and $candidateKeys -icontains 'mode') {
+                $settingsPath = $candidate
+                break
+              }
+            } catch {
+              continue
+            }
+          }
+
+          $settingsDestination = Join-Path $raw 'settings.json'
+          if ($null -ne $settingsPath) {
+            Copy-Item -LiteralPath $settingsPath -Destination $settingsDestination
+          }
+
+          function Get-Sha256Hex([byte[]]$Bytes) {
+            $sha = [System.Security.Cryptography.SHA256]::Create()
+            try {
+              return [Convert]::ToHexString($sha.ComputeHash($Bytes)).ToLowerInvariant()
+            } finally {
+              $sha.Dispose()
+            }
+          }
+
+          function Get-PropertyCaseInsensitive($Object, [string]$Name) {
+            $property = $Object.PSObject.Properties |
+              Where-Object { $_.Name -ieq $Name } |
+              Select-Object -First 1
+            if ($null -eq $property) { return $null }
+            return $property.Value
+          }
+
+          function Decode-Base64UrlJson([string]$Value) {
+            $normalized = $Value.Replace('-', '+').Replace('_', '/')
+            switch ($normalized.Length % 4) {
+              2 { $normalized += '==' }
+              3 { $normalized += '=' }
+            }
+            $bytes = [Convert]::FromBase64String($normalized)
+            return [Text.Encoding]::UTF8.GetString($bytes) | ConvertFrom-Json
+          }
+
+          $report = [ordered]@{
+            repository = $env:GITHUB_REPOSITORY
+            run_id = $env:GITHUB_RUN_ID
+            run_attempt = $env:GITHUB_RUN_ATTEMPT
+            job = $env:GITHUB_JOB
+            matrix_label = $env:F004_MATRIX_LABEL
+            runner_name = $env:RUNNER_NAME
+            runner_os = $env:RUNNER_OS
+            runner_arch = $env:RUNNER_ARCH
+            os_version = [Environment]::OSVersion.VersionString
+            hca_process_count = $hcaProcesses.Count
+            hca_service_count = $hcaServices.Count
+            hca_present = $null -ne $settingsPath
+          }
+          if ($null -ne $settingsPath) {
+            [byte[]]$settingsBytes = [IO.File]::ReadAllBytes($settingsDestination)
+            $settings = [Text.Encoding]::UTF8.GetString($settingsBytes) | ConvertFrom-Json
+            $token = [string](Get-PropertyCaseInsensitive $settings 'authToken')
+            $header = $null
+            $claims = $null
+            $parts = $token -split '\.'
+            if ($parts.Count -eq 3) {
+              try { $header = Decode-Base64UrlJson $parts[0] } catch {}
+              try { $claims = Decode-Base64UrlJson $parts[1] } catch {}
+            }
+            $endpoints = @()
+            foreach ($property in $settings.PSObject.Properties) {
+              if ($property.Value -isnot [string] -or $property.Name -notmatch '(?i)(url|uri)$') {
+                continue
+              }
+              try {
+                $uri = [Uri]$property.Value
+                $endpoints += [ordered]@{
+                  key = $property.Name
+                  scheme = $uri.Scheme
+                  hostname = $uri.Host
+                  port = $uri.Port
+                  path_sha256 = Get-Sha256Hex ([Text.Encoding]::UTF8.GetBytes($uri.AbsolutePath))
+                  has_query = -not [string]::IsNullOrWhiteSpace($uri.Query)
+                }
+              } catch {}
+            }
+            $wid = if ($null -ne $claims) { [string]$claims.wid } else { '' }
+            $report.settings_keys = @($settings.PSObject.Properties.Name | Sort-Object)
+            $report.mode = Get-PropertyCaseInsensitive $settings 'mode'
+            $report.endpoints = $endpoints
+            $report.token_alg = if ($null -ne $header) { $header.alg } else { $null }
+            $report.token_kid = if ($null -ne $header) { $header.kid } else { $null }
+            $report.token_issuer = if ($null -ne $claims) { $claims.iss } else { $null }
+            $report.token_environment = if ($null -ne $claims) { $claims.env } else { $null }
+            $report.token_has_exp = $null -ne $claims -and $null -ne $claims.exp
+            $report.worker_id_sha256 = Get-Sha256Hex ([Text.Encoding]::UTF8.GetBytes($wid))
+            $report.settings_sha256 = Get-Sha256Hex $settingsBytes
+          }
+          $metadataPath = Join-Path $sealed 'metadata.json'
+          $report | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $metadataPath -Encoding utf8
+          $report | ConvertTo-Json -Depth 8
+
+          $certificatePath = Join-Path $env:RUNNER_TEMP 'f004-certificate.pem'
+          $tarPath = Join-Path $env:RUNNER_TEMP 'f004-mode.tar'
+          Set-Content -LiteralPath $certificatePath -Value $env:F004_CAPTURE_CERT -Encoding ascii
+          tar.exe -C $raw -cf $tarPath .
+          $openssl = (Get-Command openssl -ErrorAction Stop).Source
+          & $openssl cms -encrypt -binary -aes-256-cbc `
+            -in $tarPath `
+            -outform DER `
+            -out (Join-Path $sealed 'payload.cms') `
+            $certificatePath
+          if ($LASTEXITCODE -ne 0) { throw "openssl cms failed: $LASTEXITCODE" }
+          $payloadBytes = [IO.File]::ReadAllBytes((Join-Path $sealed 'payload.cms'))
+          Set-Content -LiteralPath (Join-Path $sealed 'payload.cms.sha256') `
+            -Value (Get-Sha256Hex $payloadBytes) -Encoding ascii
+
+          foreach ($path in @($tarPath, $certificatePath, $settingsDestination)) {
+            if (Test-Path -LiteralPath $path -PathType Leaf) {
+              [byte[]]$bytes = [IO.File]::ReadAllBytes($path)
+              [Array]::Clear($bytes, 0, $bytes.Length)
+              [IO.File]::WriteAllBytes($path, $bytes)
+              Remove-Item -LiteralPath $path -Force
+            }
+          }
+          Remove-Item -LiteralPath $raw -Recurse -Force
+
+      - name: Upload sanitized inventory and encrypted source
+        uses: actions/upload-artifact@v4
+        with:
+          name: f004-hca-cross-${{ matrix.runner_label }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/f004-mode-sealed
+          retention-days: 1
+          compression-level: 0
