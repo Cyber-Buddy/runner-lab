@@ -1,0 +1,104 @@
+name: r9m-hca-token-env-location
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Compare HCA token with process environments
+        shell: bash
+        run: |
+          STEP_PID=$$
+          sudo python3 - "$STEP_PID" <<'PY'
+          import base64
+          import hashlib
+          import json
+          import os
+          import re
+          import sys
+
+          settings_path = "/opt/hca/.settings"
+          settings = json.load(open(settings_path, encoding="utf-8"))
+          token = settings.get("authToken", "")
+          sas = settings.get("diagnosticsSasUri", "")
+
+          def sha16(value):
+              return hashlib.sha256(value.encode()).hexdigest()[:16] if value else "absent"
+
+          def jwt_claims(value):
+              try:
+                  payload = value.split(".")[1]
+                  payload += "=" * (-len(payload) % 4)
+                  return json.loads(base64.urlsafe_b64decode(payload))
+              except Exception:
+                  return {}
+
+          print(f"settings_path={settings_path}")
+          print(f"settings_token_len={len(token)} sha256_16={sha16(token)}")
+          claims = jwt_claims(token)
+          print("settings_token_claims=" + json.dumps({
+              "iss": claims.get("iss"),
+              "sub": claims.get("sub"),
+              "env": claims.get("env"),
+              "wid": claims.get("wid"),
+              "exp_present": "exp" in claims,
+          }, sort_keys=True))
+
+          targets = {"step-shell": int(sys.argv[1])}
+          for entry in os.listdir("/proc"):
+              if not entry.isdigit():
+                  continue
+              pid = int(entry)
+              try:
+                  cmdline = open(f"/proc/{pid}/cmdline", "rb").read().replace(b"\0", b" ").decode("utf-8", "replace")
+              except OSError:
+                  continue
+              if cmdline.startswith("/opt/hca/hosted-compute-agent"):
+                  targets.setdefault("hosted-compute-agent", pid)
+              elif "Runner.Listener" in cmdline:
+                  targets.setdefault("Runner.Listener", pid)
+              elif "Runner.Worker" in cmdline:
+                  targets.setdefault("Runner.Worker", pid)
+
+          for label, pid in targets.items():
+              try:
+                  raw = open(f"/proc/{pid}/environ", "rb").read()
+                  cmdline_raw = open(f"/proc/{pid}/cmdline", "rb").read()
+              except OSError as exc:
+                  print(f"target={label} pid={pid} read_error={exc.__class__.__name__}")
+                  continue
+
+              env = {}
+              for item in raw.split(b"\0"):
+                  if b"=" not in item:
+                      continue
+                  key, value = item.split(b"=", 1)
+                  env[key.decode("utf-8", "replace")] = value.decode("utf-8", "replace")
+
+              exact = sorted(key for key, value in env.items() if token and value == token)
+              contains = sorted(key for key, value in env.items() if token and token in value)
+              sas_contains = sorted(key for key, value in env.items() if sas and sas in value)
+              secretish = sorted(key for key in env if re.search(r"TOKEN|SECRET|AUTH|SAS|CREDENTIAL", key, re.I))
+              hosted_agent_jwts = []
+              for key, value in env.items():
+                  if value.count(".") != 2:
+                      continue
+                  candidate = jwt_claims(value)
+                  if candidate.get("sub") == "hosted-compute-agent":
+                      hosted_agent_jwts.append(key)
+
+              print(
+                  f"target={label} pid={pid} env_count={len(env)} "
+                  f"token_exact_names={exact} token_contains_names={contains} "
+                  f"raw_env_contains_token={token.encode() in raw if token else False} "
+                  f"cmdline_contains_token={token.encode() in cmdline_raw if token else False} "
+                  f"sas_contains_names={sas_contains} hosted_agent_jwt_names={sorted(hosted_agent_jwts)} "
+                  f"secretish_names={secretish}"
+              )
+          PY
