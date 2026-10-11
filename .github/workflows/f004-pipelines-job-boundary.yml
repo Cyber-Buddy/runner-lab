@@ -24,7 +24,7 @@ jobs:
         run: |
           set -euo pipefail
           umask 077
-          canary="F004-PIPELINES-${GITHUB_RUN_ID}-${F004_SIDE}-$(openssl rand -hex 24)"
+          canary="F004-PIPELINES-${GITHUB_RUN_ID}-ATTEMPT-${GITHUB_RUN_ATTEMPT}-${F004_SIDE}-$(openssl rand -hex 24)"
           printf '%s\n' "$canary" > "$RUNNER_TEMP/f004-runtime-canary.txt"
           printf 'F004_RUNTIME_CANARY side=%s value=%s\n' "$F004_SIDE" "$canary"
 
@@ -165,6 +165,7 @@ jobs:
           pathlib.Path(sys.argv[2]).write_text(json.dumps({
               'repository': os.environ['GITHUB_REPOSITORY'],
               'run_id': os.environ['GITHUB_RUN_ID'],
+              'run_attempt': os.environ['GITHUB_RUN_ATTEMPT'],
               'side': os.environ['F004_SIDE'],
               'runner_name': os.environ['RUNNER_NAME'],
               'job_id': authority['job_id'],
@@ -190,7 +191,7 @@ jobs:
       - name: Upload encrypted authority
         uses: actions/upload-artifact@v4
         with:
-          name: f004-pipelines-${{ matrix.side }}-${{ github.run_id }}
+          name: f004-pipelines-${{ matrix.side }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/f004-pipelines-sealed
           retention-days: 1
           compression-level: 0
