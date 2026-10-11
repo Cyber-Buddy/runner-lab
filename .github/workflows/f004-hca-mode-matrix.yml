@@ -1,0 +1,126 @@
+name: f004-hca-mode-matrix
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inventory:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner_label:
+          - ubuntu-22.04
+          - ubuntu-24.04
+          - ubuntu-26.04
+          - ubuntu-slim
+    runs-on: ${{ matrix.runner_label }}
+    timeout-minutes: 10
+    env:
+      F004_CAPTURE_CERT: ${{ secrets.F004_CAPTURE_CERT }}
+      F004_MATRIX_LABEL: ${{ matrix.runner_label }}
+    steps:
+      - name: Capture sanitized HCA mode inventory
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          sealed="$RUNNER_TEMP/f004-mode-sealed"
+          raw="$RUNNER_TEMP/f004-mode-raw"
+          mkdir -p "$sealed" "$raw"
+
+          hca_present=false
+          if [[ -r /opt/hca/.settings ]]; then
+            cp /opt/hca/.settings "$raw/settings.json"
+            hca_present=true
+          elif command -v sudo >/dev/null 2>&1 && sudo -n test -r /opt/hca/.settings; then
+            sudo cp /opt/hca/.settings "$raw/settings.json"
+            sudo chown "$USER:$USER" "$raw/settings.json"
+            hca_present=true
+          fi
+          export F004_HCA_PRESENT="$hca_present"
+          export F004_VIRT_TYPE="$(systemd-detect-virt 2>/dev/null || true)"
+          export F004_CGROUP_SHA256="$(shasum -a 256 /proc/1/cgroup 2>/dev/null | awk '{print $1}')"
+
+          python3 - "$raw/settings.json" "$sealed/metadata.json" <<'PY'
+          import base64
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import urllib.parse
+
+          settings_path = pathlib.Path(os.sys.argv[1])
+          output_path = pathlib.Path(os.sys.argv[2])
+          report = {
+              'repository': os.environ['GITHUB_REPOSITORY'],
+              'run_id': os.environ['GITHUB_RUN_ID'],
+              'run_attempt': os.environ['GITHUB_RUN_ATTEMPT'],
+              'job': os.environ['GITHUB_JOB'],
+              'matrix_label': os.environ['F004_MATRIX_LABEL'],
+              'runner_name': os.environ['RUNNER_NAME'],
+              'runner_os': os.environ['RUNNER_OS'],
+              'runner_arch': os.environ['RUNNER_ARCH'],
+              'hca_present': os.environ['F004_HCA_PRESENT'] == 'true',
+              'virtualization': os.environ.get('F004_VIRT_TYPE', ''),
+              'pid1_cgroup_sha256': os.environ.get('F004_CGROUP_SHA256', ''),
+          }
+          if report['hca_present']:
+              settings = json.loads(settings_path.read_text())
+              scheduler = urllib.parse.urlsplit(settings.get('schedulerApiUrl', ''))
+              token = settings.get('authToken', '')
+              header = {}
+              claims = {}
+              if token.count('.') == 2:
+                  header_part, payload_part, _ = token.split('.')
+                  for part_name, part, destination in (
+                      ('header', header_part, header),
+                      ('payload', payload_part, claims),
+                  ):
+                      try:
+                          padded = part + '=' * (-len(part) % 4)
+                          destination.update(json.loads(base64.urlsafe_b64decode(padded)))
+                      except Exception as error:
+                          destination['decode_error_type'] = type(error).__name__
+              wid = str(claims.get('wid', ''))
+              report.update({
+                  'mode': settings.get('mode'),
+                  'scheduler_origin': (
+                      f'{scheduler.scheme}://{scheduler.netloc}'
+                      if scheduler.scheme and scheduler.netloc else ''
+                  ),
+                  'scheduler_path': scheduler.path,
+                  'token_alg': header.get('alg'),
+                  'token_kid': header.get('kid'),
+                  'token_issuer': claims.get('iss'),
+                  'token_environment': claims.get('env'),
+                  'token_has_exp': 'exp' in claims,
+                  'worker_id_sha256': hashlib.sha256(wid.encode()).hexdigest(),
+                  'settings_sha256': hashlib.sha256(settings_path.read_bytes()).hexdigest(),
+              })
+          output_path.write_text(json.dumps(report, indent=2) + '\n')
+          print(json.dumps(report, indent=2))
+          PY
+
+          if [[ "$hca_present" == true ]]; then
+            test -n "$F004_CAPTURE_CERT"
+            printf '%s\n' "$F004_CAPTURE_CERT" > "$RUNNER_TEMP/f004-certificate.pem"
+            openssl cms -encrypt -binary -aes-256-cbc \
+              -in "$raw/settings.json" \
+              -outform DER \
+              -out "$sealed/settings.cms" \
+              "$RUNNER_TEMP/f004-certificate.pem"
+            shasum -a 256 "$sealed/settings.cms" | awk '{print $1}' > "$sealed/settings.cms.sha256"
+            shred -u "$RUNNER_TEMP/f004-certificate.pem" "$raw/settings.json"
+          fi
+          rmdir "$raw"
+
+      - name: Upload sanitized inventory and encrypted settings
+        uses: actions/upload-artifact@v4
+        with:
+          name: f004-hca-mode-${{ matrix.runner_label }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/f004-mode-sealed
+          retention-days: 1
+          compression-level: 0
