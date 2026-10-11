@@ -1,0 +1,43 @@
+name: f004-queuedrequests-controlled
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Delay target admission until blocker is active
+        shell: bash
+        run: sleep 25
+
+  blocker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: f004-queuedrequests-controlled
+      cancel-in-progress: false
+    steps:
+      - name: Hold researcher-owned concurrency slot
+        shell: bash
+        run: |
+          printf 'F004_QUEUE_BLOCKER run=%s attempt=%s\n' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+          sleep 420
+
+  target-b:
+    needs: gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    concurrency:
+      group: f004-queuedrequests-controlled
+      cancel-in-progress: false
+    env:
+      F004_QUEUED_CANARY: F004-QUEUED-B-${{ github.run_id }}-${{ github.run_attempt }}-4cb9331a
+    steps:
+      - name: Emit B canary only after queue release
+        shell: bash
+        run: printf 'F004_QUEUED_CANARY=%s\n' "$F004_QUEUED_CANARY"
