@@ -93,7 +93,9 @@ jobs:
           C
           gcc -O0 -s "$RUNNER_TEMP/f004-benign-canary.c" -o "$RUNNER_TEMP/xmrig"
           shasum -a 256 "$RUNNER_TEMP/xmrig" > "$raw/canary.sha256"
-          strings "$RUNNER_TEMP/xmrig" | rg 'F004_BENIGN_PROCESS_NAME_CANARY_NO_MINING_OR_HASHING' > "$raw/canary-marker.txt"
+          strings "$RUNNER_TEMP/xmrig" \
+            | grep -F 'F004_BENIGN_PROCESS_NAME_CANARY_NO_MINING_OR_HASHING' \
+            > "$raw/canary-marker.txt"
 
           if command -v strace >/dev/null 2>&1; then
             sudo strace -ff -s 16384 -e trace=write -e write=2 \
