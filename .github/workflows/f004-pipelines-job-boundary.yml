@@ -12,7 +12,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        side: [A]
+        side: [A, B]
     name: controlled-${{ matrix.side }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -29,6 +29,8 @@ jobs:
           canary="F004-PIPELINES-${GITHUB_RUN_ID}-${F004_SIDE}-$(openssl rand -hex 24)"
           printf '%s\n' "$canary" > "$RUNNER_TEMP/f004-runtime-canary.txt"
           printf 'F004_RUNTIME_CANARY side=%s value=%s\n' "$F004_SIDE" "$canary"
+          printf 'F004_SUMMARY_CANARY side=%s value=%s\n' "$F004_SIDE" "$canary" \
+            >> "$GITHUB_STEP_SUMMARY"
 
       - name: Capture encrypted job authority
         shell: bash
