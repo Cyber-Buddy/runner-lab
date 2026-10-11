@@ -146,12 +146,61 @@ jobs:
                   'error': '',
               }
 
+          def readlink_probe(path):
+              try:
+                  return {'value': os.readlink(path), 'error': ''}
+              except OSError as error:
+                  return {
+                      'value': '',
+                      'error': f'{error.errno}:{error.strerror}',
+                  }
+
+          def root_mount_record(pid):
+              try:
+                  lines = pathlib.Path(f'/proc/{pid}/mountinfo').read_text(
+                      errors='replace'
+                  ).splitlines()
+              except OSError as error:
+                  return {'error': f'{error.errno}:{error.strerror}'}
+              for line in lines:
+                  left, separator, right = line.partition(' - ')
+                  if not separator:
+                      continue
+                  fields = left.split()
+                  right_fields = right.split()
+                  if len(fields) < 6 or len(right_fields) < 2:
+                      continue
+                  if fields[4] != '/':
+                      continue
+                  return {
+                      'mount_options': fields[5].split(','),
+                      'optional_fields': fields[6:],
+                      'fs_type': right_fields[0],
+                      'mount_root_sha256': hashlib.sha256(
+                          fields[3].encode()
+                      ).hexdigest(),
+                      'source_sha256': hashlib.sha256(
+                          right_fields[1].encode()
+                      ).hexdigest(),
+                      'error': '',
+                  }
+              return {'error': 'root mount not found'}
+
           root_status = status_fields('/proc/self/status')
           self_namespaces = namespace_set('self')
           pid1_namespaces = namespace_set('1')
           hca_namespaces = namespace_set(hca_pid) if hca_pid else {}
           paths = (
               '/proc/1/root',
+              '/proc/1/root/bin',
+              '/proc/1/root/etc',
+              '/proc/1/root/proc',
+              '/proc/1/root/run',
+              '/proc/1/root/sys',
+              '/proc/1/root/tmp',
+              '/proc/1/root/usr',
+              '/proc/1/root/.dockerenv',
+              '/proc/1/root/pause',
               '/proc/1/root/run/gcs',
               '/proc/1/root/run/containerd/containerd.sock',
               '/proc/1/root/var/run/docker.sock',
@@ -177,6 +226,18 @@ jobs:
                   '/', f'/proc/{hca_pid}/root'
               ) if hca_pid else {'same': None, 'error': 'hca absent'},
               'path_probes': {path: path_probe(path) for path in paths},
+              'pid1_executable': readlink_probe('/proc/1/exe'),
+              'pid1_root_mount': root_mount_record('1'),
+              'pid1_root_access': {
+                  'readable': os.access('/proc/1/root', os.R_OK),
+                  'writable': os.access('/proc/1/root', os.W_OK),
+                  'executable': os.access('/proc/1/root', os.X_OK),
+              },
+              'pid1_tmp_access': {
+                  'readable': os.access('/proc/1/root/tmp', os.R_OK),
+                  'writable': os.access('/proc/1/root/tmp', os.W_OK),
+                  'executable': os.access('/proc/1/root/tmp', os.X_OK),
+              },
               'active_namespace_entry_attempted': False,
               'filesystem_write_probe_attempted': False,
           }
