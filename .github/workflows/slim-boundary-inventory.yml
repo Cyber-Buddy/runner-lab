@@ -1,0 +1,68 @@
+name: ubuntu-slim boundary inventory
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  slim-boundary:
+    runs-on: ubuntu-slim
+    timeout-minutes: 5
+    steps:
+      - name: Read-only container boundary inventory
+        shell: bash
+        run: |
+          set -u
+          echo 'marker=slim-boundary-inventory-v1'
+          id
+          uname -a
+          printf '%s\n' '--- status ---'
+          grep -E '^(Name|Pid|PPid|TracerPid|Uid|Gid|NSpid|Cap(Inh|Prm|Eff|Bnd|Amb)|NoNewPrivs|Seccomp|Seccomp_filters):' /proc/self/status || true
+          printf '%s\n' '--- namespaces ---'
+          for namespace in pid mnt user cgroup net uts ipc; do
+            printf '%s self=' "$namespace"
+            readlink "/proc/self/ns/$namespace" || true
+            printf '%s pid1=' "$namespace"
+            readlink "/proc/1/ns/$namespace" || true
+          done
+          printf '%s\n' '--- pid1 and root ---'
+          cat /proc/1/comm || true
+          readlink /proc/1/exe || true
+          stat -c 'self-root device=%d inode=%i mode=%a owner=%u:%g' /
+          stat -Lc 'pid1-root device=%d inode=%i mode=%a owner=%u:%g' /proc/1/root || true
+          ls -la /proc/1/root 2>&1 | sed -n '1,40p'
+          printf '%s\n' '--- mounts ---'
+          findmnt -R / -o TARGET,SOURCE,FSTYPE,OPTIONS 2>&1 | sed -n '1,100p' || true
+          grep -E '(/ |/etc/(hosts|hostname|resolv.conf)|/run|/var/run|/sys/fs/cgroup)' /proc/self/mountinfo | sed -n '1,100p' || true
+          printf '%s\n' '--- runtime sockets and credentials ---'
+          ls -la /var/run/docker.sock /run/docker.sock /run/containerd/containerd.sock /run/k3s/containerd/containerd.sock 2>&1 || true
+          ls -la /var/run/secrets/kubernetes.io/serviceaccount /run/secrets/kubernetes.io/serviceaccount 2>&1 || true
+          printf '%s\n' '--- devices ---'
+          find /dev -maxdepth 2 -printf '%y %m %u:%g %p %l\n' 2>&1 | sort | sed -n '1,160p'
+          ls -la /dev/kvm /dev/vhost-vsock /dev/vsock /dev/fuse /dev/loop-control /dev/mapper/control 2>&1 || true
+          printf '%s\n' '--- cgroups ---'
+          cat /proc/self/cgroup || true
+          cat /proc/1/cgroup || true
+          for file in cpu.max memory.max pids.max cgroup.controllers cgroup.subtree_control; do
+            printf '%s=' "$file"
+            cat "/sys/fs/cgroup/$file" 2>&1 || true
+          done
+          printf '%s\n' '--- security controls ---'
+          cat /proc/sys/kernel/core_pattern 2>&1 || true
+          cat /proc/sys/kernel/unprivileged_userns_clone 2>&1 || true
+          cat /proc/sys/user/max_user_namespaces 2>&1 || true
+          cat /proc/self/attr/current 2>&1 || true
+          command -v capsh >/dev/null && capsh --print 2>&1 | sed -n '1,80p' || true
+          command -v unshare >/dev/null && unshare -Ur true >/tmp/unshare.out 2>&1
+          printf 'unshare_userns_exit=%s output=' "$?"
+          sed -n '1,3p' /tmp/unshare.out 2>/dev/null || true
+          ls -la /proc/kcore /proc/keys /proc/sysrq-trigger /sys/kernel/security 2>&1 || true
+          printf '%s\n' '--- metadata reachability without body readback ---'
+          for url in \
+            'http://169.254.169.254/latest/meta-data/' \
+            'http://169.254.169.254/metadata/instance?api-version=2021-02-01' \
+            'http://metadata.google.internal/computeMetadata/v1/'; do
+            curl -sS -m 2 -o /dev/null -w "$url http=%{http_code} bytes=%{size_download}\n" -H 'Metadata: true' -H 'Metadata-Flavor: Google' "$url" || true
+          done
