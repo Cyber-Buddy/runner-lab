@@ -1,0 +1,214 @@
+name: f004-provjobd-benign-signature-calibration
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  calibrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      F004_CAPTURE_CERT: ${{ secrets.F004_CAPTURE_CERT }}
+    steps:
+      - name: Exercise bounded non-mining detector controls
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          test -n "$F004_CAPTURE_CERT"
+          raw="$RUNNER_TEMP/f004-provjobd-signature-raw"
+          sealed="$RUNNER_TEMP/f004-provjobd-signature-sealed"
+          mkdir -p "$raw" "$sealed"
+
+          provjobd_pid=$(pgrep -o -f '^/tmp/provjobd[0-9]+$')
+          test -n "$provjobd_pid"
+          sudo cp /opt/hca/provjobd_override.json "$raw/provjobd_override.json" 2>/dev/null || true
+          sudo cp "/proc/$provjobd_pid/status" "$raw/provjobd.status"
+          sudo journalctl --no-pager -u hosted-compute-agent.service > "$raw/hca-journal-before.txt" || true
+
+          sudo strace -f -s 16384 -e trace=write -p "$provjobd_pid" 2>&1 \
+            | grep --line-buffered -F '[signal]' \
+            | tee "$raw/provjobd-signals.log" &
+          trace_pipeline_pid=$!
+          sleep 2
+
+          cat > "$RUNNER_TEMP/f004-neutral.c" <<'C'
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <time.h>
+          #include <unistd.h>
+
+          static void bounded_idle(unsigned seconds) {
+            sleep(seconds);
+          }
+
+          static void bounded_arithmetic(unsigned seconds) {
+            struct timespec started;
+            struct timespec now;
+            volatile unsigned long long value = 0x46403030344e4f4eULL;
+            clock_gettime(CLOCK_MONOTONIC, &started);
+            do {
+              for (unsigned long long index = 1; index < 5000000ULL; index++) {
+                value = (value + index) ^ (value << 7) ^ (value >> 3);
+              }
+              clock_gettime(CLOCK_MONOTONIC, &now);
+            } while ((unsigned)(now.tv_sec - started.tv_sec) < seconds);
+            if (value == 0xdeadbeefULL) {
+              puts("unreachable");
+            }
+          }
+
+          int main(int argc, char **argv) {
+            if (argc != 3) {
+              return 64;
+            }
+            unsigned seconds = (unsigned)strtoul(argv[2], NULL, 10);
+            puts("F004_BENIGN_ARITHMETIC_CANARY_NO_MINING_NO_HASHING_NO_NETWORK");
+            fflush(stdout);
+            if (strcmp(argv[1], "idle") == 0) {
+              bounded_idle(seconds);
+              return 0;
+            }
+            if (strcmp(argv[1], "arithmetic") == 0) {
+              bounded_arithmetic(seconds);
+              return 0;
+            }
+            return 65;
+          }
+          C
+
+          cat > "$RUNNER_TEMP/f004-signature.c" <<'C'
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <time.h>
+          #include <unistd.h>
+
+          static const volatile char detector_calibration_only[] =
+            "Usage: xmrig\0"
+            "api.xmrig.com\0"
+            "randomx_run\0"
+            "XMR-Stak-Miner\0"
+            "mining.subscribe\0"
+            "F004_BENIGN_SIGNATURE_CANARY_NO_MINING_NO_HASHING_NO_NETWORK";
+
+          static void bounded_idle(unsigned seconds) {
+            sleep(seconds);
+          }
+
+          static void bounded_arithmetic(unsigned seconds) {
+            struct timespec started;
+            struct timespec now;
+            volatile unsigned long long value = 0x4640303034534947ULL;
+            clock_gettime(CLOCK_MONOTONIC, &started);
+            do {
+              for (unsigned long long index = 1; index < 5000000ULL; index++) {
+                value = (value + index) ^ (value << 7) ^ (value >> 3);
+              }
+              clock_gettime(CLOCK_MONOTONIC, &now);
+            } while ((unsigned)(now.tv_sec - started.tv_sec) < seconds);
+            if (value == (unsigned long long)detector_calibration_only[0]) {
+              puts("unreachable");
+            }
+          }
+
+          int main(int argc, char **argv) {
+            if (argc != 3) {
+              return 64;
+            }
+            unsigned seconds = (unsigned)strtoul(argv[2], NULL, 10);
+            puts("F004_BENIGN_SIGNATURE_CANARY_NO_MINING_NO_HASHING_NO_NETWORK");
+            fflush(stdout);
+            if (strcmp(argv[1], "idle") == 0) {
+              bounded_idle(seconds);
+              return 0;
+            }
+            if (strcmp(argv[1], "arithmetic") == 0) {
+              bounded_arithmetic(seconds);
+              return 0;
+            }
+            return 65;
+          }
+          C
+
+          gcc -O0 -s "$RUNNER_TEMP/f004-neutral.c" -o "$RUNNER_TEMP/f004-neutral"
+          gcc -O0 -s "$RUNNER_TEMP/f004-signature.c" -o "$RUNNER_TEMP/f004-signature"
+          shasum -a 256 "$RUNNER_TEMP/f004-neutral" "$RUNNER_TEMP/f004-signature" > "$raw/binary-sha256.txt"
+          strings "$RUNNER_TEMP/f004-signature" \
+            | grep -E 'Usage: xmrig|api\.xmrig\.com|randomx_run|XMR-Stak-Miner|mining\.subscribe|F004_BENIGN_SIGNATURE' \
+            > "$raw/signature-proof.txt"
+
+          printf 'timestamp\tphase\tpid\talive\trunner_worker_alive\tprovjobd_present\thca_alive\n' > "$raw/timeline.tsv"
+          run_phase() {
+            phase="$1"
+            binary="$2"
+            mode="$3"
+            seconds="$4"
+            printf 'F004_PHASE_START %s %s\n' "$phase" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            "$binary" "$mode" "$seconds" > "$raw/$phase.stdout" 2> "$raw/$phase.stderr" &
+            phase_pid=$!
+            for index in $(seq 0 "$seconds"); do
+              alive=no
+              runner_worker_alive=no
+              provjobd_present=no
+              hca_alive=no
+              kill -0 "$phase_pid" 2>/dev/null && alive=yes || true
+              pgrep -f 'Runner.Worker' >/dev/null && runner_worker_alive=yes || true
+              pgrep -f '^/tmp/provjobd[0-9]+$' >/dev/null && provjobd_present=yes || true
+              systemctl is-active --quiet hosted-compute-agent.service && hca_alive=yes || true
+              printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+                "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$phase" "$phase_pid" "$alive" \
+                "$runner_worker_alive" "$provjobd_present" "$hca_alive" \
+                | tee -a "$raw/timeline.tsv"
+              [[ "$alive" == yes ]] || break
+              sleep 1
+            done
+            set +e
+            wait "$phase_pid"
+            phase_status=$?
+            set -e
+            printf '%s\n' "$phase_status" > "$raw/$phase.exit-status"
+            printf 'F004_PHASE_END %s status=%s %s\n' "$phase" "$phase_status" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          }
+
+          run_phase signature_idle "$RUNNER_TEMP/f004-signature" idle 35
+          run_phase neutral_arithmetic "$RUNNER_TEMP/f004-neutral" arithmetic 35
+          run_phase signature_arithmetic "$RUNNER_TEMP/f004-signature" arithmetic 45
+
+          sudo pkill -INT -x strace 2>/dev/null || true
+          kill -INT "$trace_pipeline_pid" 2>/dev/null || true
+          wait "$trace_pipeline_pid" 2>/dev/null || true
+          sudo journalctl --no-pager -u hosted-compute-agent.service > "$raw/hca-journal-after.txt" || true
+          ps -eo user,pid,ppid,stat,lstart,args ww > "$raw/processes-after.txt"
+
+          sudo chown -R "$USER:$USER" "$raw"
+          chmod -R u=rwX,go= "$raw"
+          printf '%s\n' "$F004_CAPTURE_CERT" > "$RUNNER_TEMP/f004-certificate.pem"
+          tar -C "$raw" -cf "$RUNNER_TEMP/f004-provjobd-signature.tar" .
+          openssl cms -encrypt -binary -aes-256-cbc \
+            -in "$RUNNER_TEMP/f004-provjobd-signature.tar" \
+            -outform DER \
+            -out "$sealed/payload.cms" \
+            "$RUNNER_TEMP/f004-certificate.pem"
+          shasum -a 256 "$sealed/payload.cms" | awk '{print $1}' > "$sealed/payload.cms.sha256"
+          jq -n \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg runner_name "$RUNNER_NAME" \
+            '{repository:$repository,run_id:$run_id,runner_name:$runner_name,canary_kind:"bounded non-mining signature and arithmetic controls"}' \
+            > "$sealed/metadata.json"
+          shred -u "$RUNNER_TEMP/f004-provjobd-signature.tar" "$RUNNER_TEMP/f004-certificate.pem"
+          sudo rm -rf "$raw"
+
+      - name: Upload encrypted calibration evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: f004-provjobd-signature-${{ github.run_id }}
+          path: ${{ runner.temp }}/f004-provjobd-signature-sealed
+          retention-days: 1
+          compression-level: 0
