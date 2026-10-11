@@ -1,0 +1,81 @@
+name: F004 OIDC authority A and C
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+  actions: read
+
+jobs:
+  controlled:
+    name: controlled-${{ matrix.side }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        side: [A, C]
+    env:
+      F004_SIDE: ${{ matrix.side }}
+      F004_CAPTURE_CERT: ${{ secrets.F004_CAPTURE_CERT }}
+    steps:
+      - name: Capture encrypted OIDC authority
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          test -n "$F004_CAPTURE_CERT"
+          test -n "$ACTIONS_ID_TOKEN_REQUEST_URL"
+          test -n "$ACTIONS_ID_TOKEN_REQUEST_TOKEN"
+
+          raw="$RUNNER_TEMP/f004-oidc-raw"
+          sealed="$RUNNER_TEMP/f004-oidc-sealed"
+          mkdir -p "$raw" "$sealed"
+          canary="F004-OIDC-${GITHUB_REPOSITORY}-${GITHUB_RUN_ID}-${F004_SIDE}-$(openssl rand -hex 24)"
+
+          jq -n \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg side "$F004_SIDE" \
+            --arg request_url "$ACTIONS_ID_TOKEN_REQUEST_URL" \
+            --arg request_token "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            --arg canary "$canary" \
+            '{repository:$repository,run_id:$run_id,side:$side,request_url:$request_url,request_token:$request_token,canary:$canary}' \
+            > "$raw/authority.json"
+
+          token_sha=$(printf '%s' "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" | shasum -a 256 | awk '{print $1}')
+          url_sha=$(printf '%s' "$ACTIONS_ID_TOKEN_REQUEST_URL" | shasum -a 256 | awk '{print $1}')
+          canary_sha=$(printf '%s' "$canary" | shasum -a 256 | awk '{print $1}')
+          jq -n \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg side "$F004_SIDE" \
+            --arg token_sha256 "$token_sha" \
+            --arg url_sha256 "$url_sha" \
+            --arg canary_sha256 "$canary_sha" \
+            '{repository:$repository,run_id:$run_id,side:$side,token_sha256:$token_sha256,url_sha256:$url_sha256,canary_sha256:$canary_sha256}' \
+            > "$sealed/metadata.json"
+
+          printf '%s\n' "$F004_CAPTURE_CERT" > "$RUNNER_TEMP/f004-certificate.pem"
+          tar -C "$raw" -cf "$RUNNER_TEMP/f004-oidc.tar" .
+          openssl cms -encrypt -binary -aes-256-cbc \
+            -in "$RUNNER_TEMP/f004-oidc.tar" \
+            -outform DER \
+            -out "$sealed/payload.cms" \
+            "$RUNNER_TEMP/f004-certificate.pem"
+          shasum -a 256 "$sealed/payload.cms" | awk '{print $1}' > "$sealed/payload.cms.sha256"
+          shred -u "$RUNNER_TEMP/f004-oidc.tar" "$RUNNER_TEMP/f004-certificate.pem"
+          rm -rf "$raw"
+
+      - name: Upload encrypted authority
+        uses: actions/upload-artifact@v4
+        with:
+          name: f004-oidc-${{ matrix.side }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/f004-oidc-sealed
+          retention-days: 1
+          compression-level: 0
+
+      - name: Hold controlled job live
+        run: sleep 600
