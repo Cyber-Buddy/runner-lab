@@ -218,7 +218,7 @@ jobs:
 
   service-queued-b:
     name: F004-DT-QUEUED-B-${{ github.run_id }}-${{ github.run_attempt }}-dd0c6f71
-    runs-on: f004-scaleset-b-6a51c9
+    runs-on: f004-scaleset-b2-6a51c9
     env:
       F004_QUEUED_CANARY: F004-DT-QUEUE-B-${{ github.run_id }}-${{ github.run_attempt }}-dd0c6f71
     steps:
